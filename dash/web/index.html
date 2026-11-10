@@ -2,13 +2,15 @@
 <!-- Capy Flash dashboard: trimmed from basalt serve/web/index.html @ main cc0a763.
      Dropped: Experts sidebar panel (dense 27B model has no expert tiers), model
      picker (#models/#crumb-sep - one model per engine), load % bar (#pct/#pbar -
-     ninfer never hot-loads), font preloads (no /fonts/ route on the sidecar). -->
+     ninfer never hot-loads); font preloads restored with the /fonts/ route. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Capy Flash</title>
 <link rel="icon" type="image/svg+xml" href="web/mark.svg">
+<link rel="preload" href="fonts/geist-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/geist-mono-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="web/app.css">
 <script defer src="web/app.js"></script>
 </head>
