@@ -54,6 +54,8 @@ class Handler(BaseHTTPRequestHandler):
         query = urlsplit(self.path).query
         if path in ("/", "") or path.startswith("/web/"):
             return self._static(path)
+        if path.startswith("/fonts/"):
+            return self._fonts(path)
         if path in ("/health", "/api/health"):
             return self._json(200, {"status": "ok", "service": "capy-dash",
                                     "engine_up": bool(STATE.engine_up),
@@ -84,6 +86,12 @@ class Handler(BaseHTTPRequestHandler):
                  "image/svg+xml" if name.endswith(".svg") else
                  "font/woff2" if name.endswith(".woff2") else "application/octet-stream")
         return self._file(os.path.join(WEB_DIR, name), ctype)
+
+    def _fonts(self, path: str):
+        name = path[len("/fonts/"):]                   # flat .woff2 only (basalt handler parity)
+        if not name or "/" in name or "\\" in name or not name.endswith(".woff2"):
+            return self._json(404, {"error": {"message": "not found"}})
+        return self._file(os.path.join(WEB_DIR, "fonts", name), "font/woff2")
 
     def _logs(self, query: str):
         from urllib.parse import parse_qs
