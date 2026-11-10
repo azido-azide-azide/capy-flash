@@ -1,0 +1,81 @@
+<!doctype html>
+<!-- Capy Flash dashboard: trimmed from basalt serve/web/index.html @ main cc0a763.
+     Dropped: Experts sidebar panel (dense 27B model has no expert tiers), model
+     picker (#models/#crumb-sep - one model per engine), load % bar (#pct/#pbar -
+     ninfer never hot-loads), font preloads (no /fonts/ route on the sidecar). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Capy Flash</title>
+<link rel="icon" type="image/svg+xml" href="web/mark.svg">
+<link rel="stylesheet" href="web/app.css">
+<script defer src="web/app.js"></script>
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand"><img src="web/mark.svg" alt=""><span class="wordmark">Capy Flash</span></div>
+  <div class="crumb">
+    <span class="model" id="model"></span>
+  </div>
+  <span class="grow"></span>
+  <span class="sp">
+    <span class="lab"><span class="state" id="state" data-s="offline">Connecting</span></span>
+  </span>
+  <span class="where" id="host"></span>
+  <span class="where" id="keyed" hidden>API key</span>
+</header>
+
+<form class="auth" id="auth" hidden>
+  <label for="key">API key</label>
+  <input id="key" type="password" autocomplete="off" placeholder="Required by this server">
+  <button>Connect</button>
+</form>
+
+<main class="lay">
+  <aside class="a-side sb" aria-label="Hardware">
+    <div class="sb-h">GPUs<span>Charts · Last 60 s</span></div>
+    <div class="sb-gpus" id="gpus"></div>
+    <div class="sb-sys">
+      <div class="sb-h">System<span id="cpu-name"></span></div>
+      <div class="sb-body" id="sys"></div>
+    </div>
+  </aside>
+
+  <section class="a-hero card" aria-label="Speed">
+    <div class="hd"><b>Speed</b><span>Last 60 s</span></div>
+    <div class="trio">
+      <div class="dec">
+        <div class="k" id="dec-k">Decode</div>
+        <div class="v big" id="dec-v">-</div>
+        <div class="cw" id="dec-chart"></div>
+      </div>
+      <div class="pre">
+        <div class="k" id="pre-k">Prefill</div>
+        <div class="v mid" id="pre-v">-</div>
+        <div class="pcw" id="pre-chart"></div>
+        <div class="pst">
+          <div><span>Last prompt</span><span id="pre-last">-</span></div>
+          <div><span>Prefix cache hit</span><b id="pre-hit">-</b></div>
+        </div>
+      </div>
+    </div>
+    <div class="hfoot"><div id="foot-dec"></div><div id="foot-pre"></div></div>
+  </section>
+
+  <section class="a-main card" aria-label="Requests">
+    <div class="tabs" role="tablist" id="tabs"></div>
+    <div class="pane" id="pane" role="tabpanel"></div>
+  </section>
+
+  <section class="a-logs card" aria-label="Logs">
+    <div class="hd lh"><b>Logs</b>
+      <div class="tabs ltabs" role="tablist" id="logtabs" aria-label="Log levels"></div>
+      <span class="grow"></span><span id="log-count"></span></div>
+    <div class="logs" id="log" role="log" aria-live="off" tabindex="0"></div>
+  </section>
+</main>
+
+</body>
+</html>
