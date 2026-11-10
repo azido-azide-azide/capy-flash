@@ -890,7 +890,9 @@ ProgramImpl::shared_prefix_summary(const SharedPrefixState& shared) const {
 }
 
 PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence,
-                                             runtime::ExecutionTiming* failed_timing) {
+                                             runtime::ExecutionTiming* failed_timing,
+                                             runtime::TokenMaskProvider* masks) {
+    const RoundMaskScope mask_scope(*this, masks);
     if (pending_transaction_ || !valid_sequence(sequence)) {
         throw std::logic_error("prefill sequence capability is invalid");
     }
@@ -1915,6 +1917,9 @@ DeviceKVCompaction ProgramImpl::compact_device_kv() {
         synchronize_devices();
         qwen4_elastic->shrink_to_live();
     }
+    // Active KV in RAM: the Host planes' RAM follows the packed extent.
+    decoder->text_kv.page_pool().trim_host_backing();
+    if (qwen3_5::PagedKVCache* mtp = decoder->mtp_cache()) { mtp->page_pool().trim_host_backing(); }
     out.columns_after = qwen4_elastic->stats().columns;
     return out;
 }

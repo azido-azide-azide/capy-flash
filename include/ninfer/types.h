@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/output_constraint.h"
+
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -31,6 +33,12 @@ inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
 inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
+// How long a request may wait for preparation and admission before HTTP 503. Ten minutes: with
+// --max-concurrency 1 a request waits until the requests ahead of it finish, and prompts are
+// prefilled one at a time, so several long prompts queue for minutes (a 120k-token Flash-Next
+// prompt takes about 31 s on two 16 GB GPUs). It also matches the default timeout of the OpenAI and
+// Anthropic SDKs.
+inline constexpr std::uint32_t kDefaultPendingTimeoutMs = 600'000;
 // Bounds of EngineOptions::max_vision_tokens. One merged Vision token covers 32x32 pixels, so the
 // minimum is the registered 65,536-pixel image floor and the maximum the per-item execution
 // ceiling.
@@ -342,20 +350,21 @@ struct RoutedExpertOptions {
 
 // Elastic VRAM between the KV cache and the routed-expert slot cache (T64; Qwen4Exp offload
 // backend). Off: the KV pool is sized and backed for max_context at startup and the expert slots
-// take what is left (a fixed partition). On: the KV pool keeps its addresses for max_context but
+// take what is left (a fixed partition). On: the KV pool keeps its addresses for kv_capacity but
 // only the pages in use are backed by device memory; the expert cache gets every other byte. Its
-// slots are base slots, enough for max_context's KV (or for kv_budget_bytes), plus elastic
+// slots are base slots, enough for the whole pool's KV (or for kv_budget_bytes), plus elastic
 // columns: one more slot in every layer per column. When the KV needs more pages, the cache gives
 // up whole columns (each layer drops its coldest experts, ExpertCachePolicy::set_active_columns),
-// their memory backs the KV pages; when a new request starts, KV pages past the live extent are
-// released and the columns come back (refilled by later insertions). Requires the offload backend
-// and slots_per_layer = 0 (resolved).
+// their memory backs the KV pages; when a new request starts, KV pages past the live extent (of
+// every request still holding pages) are released and the columns come back (refilled by later
+// insertions). Requires the offload backend and slots_per_layer = 0 (resolved).
 struct ElasticKvOptions {
     bool enabled = false;
     // KV backing grows (and starts) in steps of this many tokens per pool.
     std::uint32_t grow_tokens = 8192;
-    // > 0: at most this many bytes of KV per GPU (text + MTP pools); the base slots are sized for
-    // it instead of max_context's KV, and a request needing more KV fails.
+    // > 0: at most this many bytes of KV per GPU (text + MTP pools, every request together); the
+    // base slots are sized for it instead of the whole pool's KV, and a request needing more KV
+    // fails.
     std::size_t kv_budget_bytes = 0;
 };
 
@@ -377,13 +386,22 @@ struct EngineOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t pending_timeout_ms   = kDefaultPendingTimeoutMs;
+    // Decoding requests' share of the time while another request's prompt runs: after a prompt
+    // unit of t seconds the decode batch runs rounds for up to decode_share * t seconds (at least
+    // one round) before the next prompt unit. 0 = one round per prompt unit (a long Flash-Next
+    // prompt unit then stalls the others for seconds); 1 = equal time.
+    float decode_share          = 0.0F;
+    std::uint32_t prefill_chunk = 1024;
     // Device KV lease window (capy-flash): a request reserves its prompt plus this many output
     // tokens (at least prefill_chunk) and grows the reservation as its answer grows. 0 reserves
     // the whole max_tokens at admission, as before the lease.
     std::uint32_t kv_lease_window_tokens = 4096;
     KvCacheStorage kv_cache              = KvCacheStorage::BFloat16;
+    // YaRN RoPE extension factor. 1.0 = disabled and leaves every compiled-in RoPE
+    // constant untouched. Above 1 it raises the addressable context ceiling to
+    // factor x the variant native window; the serve layer installs the tables.
+    float rope_yarn_factor = 1.0F;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -429,13 +447,17 @@ struct EngineOptions {
     RoutedExpertOptions routed_experts;
     ElasticKvOptions elastic_kv;
     // Active KV in RAM (Qwen4Exp, docs/maintainer/active-kv-in-ram.md): the text KV pool's K/V and
-    // QSA index records live in pinned Host memory (only the QSA block keys stay in VRAM); each
-    // step brings the indexer's selected blocks into a VRAM cache, prefill stages the visible pages
-    // of each layer. Frees the KV's VRAM for expert slots. Requires max_concurrency 1.
+    // QSA index records live in pinned Host memory (only the QSA block keys stay in VRAM), whose
+    // RAM follows the pages in use (the kv_capacity pages at most); each step brings the
+    // indexer's selected blocks of every decoding request into a VRAM cache, prefill stages the
+    // visible pages of each layer. Frees the KV's VRAM for expert slots or for more requests.
     bool kv_ram_active = false;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
+    // Structured output: input limits, compilation limits, grammar cache and matcher time budgets
+    // (output_constraint.h). Unconstrained requests never read them.
+    OutputConstraintLimits constraint_limits;
 };
 
 enum class SamplingMode : std::uint8_t {
@@ -530,6 +552,11 @@ struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    // Structured output (Neroued/ninfer 77c2e5e2 keeps these first; appended here so existing
+    // aggregate and designated initializers stay valid). Empty constraint + default tool_choice =
+    // unconstrained request, identical to the previous behaviour.
+    std::optional<OutputConstraint> constraint;
+    ToolChoice tool_choice;
 };
 
 enum class MediaKind : std::uint8_t {
@@ -783,17 +810,45 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    // Structured output (Neroued/ninfer 77c2e5e2). Appended so the existing values keep their
+    // numbering.
+    UnsupportedOutputCombination,
+    InvalidToolConstraint,
+    InvalidToolOutput,
+    InvalidGrammar,
+    InvalidChoice,
+    InvalidRegex,
+    InvalidJsonSchema,
+    UnsupportedJsonSchema,
+    UnsatisfiableJsonSchema,
+    ConstraintDeadEnd,
+    // capy-flash structured output limits (OutputConstraintLimits): an input over a size, depth or
+    // item limit, or a compilation over its time limit; and a request whose matcher work exceeded
+    // its time budget while generating.
+    ConstraintLimitExceeded,
+    ConstraintBudgetExceeded,
 };
 
+enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };
+
+// pointer is a JSON Pointer into the constraint or tool schema (empty when not applicable).
 class RequestError final : public std::invalid_argument {
 public:
-    RequestError(RequestErrorKind kind, std::string message)
-        : std::invalid_argument(std::move(message)), kind_(kind) {}
+    RequestError(RequestErrorKind kind, std::string message, std::string pointer = {},
+                 RequestErrorSource source = RequestErrorSource::OutputConstraint)
+        : std::invalid_argument(std::move(message)), kind_(kind), pointer_(std::move(pointer)),
+          source_(source) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
 
+    [[nodiscard]] RequestErrorSource source() const noexcept { return source_; }
+
+    [[nodiscard]] const std::string& pointer() const noexcept { return pointer_; }
+
 private:
     RequestErrorKind kind_;
+    std::string pointer_;
+    RequestErrorSource source_;
 };
 
 struct PromptSummary {

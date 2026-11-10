@@ -175,6 +175,7 @@ public:
     [[nodiscard]] ControlMembership build_control_membership(const Slots& slots,
                                                              std::uint32_t max_concurrency) const {
         ControlMembership membership;
+        bool stride_completes_close = false;
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             const auto& request = slots[lane];
             if (request == nullptr || !request->is_control_ready() || request->capture_pending) {
@@ -187,12 +188,20 @@ public:
             if (control.empty() || control.size() > request->budget->remaining()) {
                 throw std::logic_error("control-ready request has no admissible control span");
             }
+            const bool completes_close = request->output.control_completes_close();
             if (membership.row_stride == 0) {
                 membership.row_stride = static_cast<std::uint32_t>(control.size());
                 membership.tokens.reserve(static_cast<std::size_t>(membership.row_stride) *
                                           max_concurrency);
+                stride_completes_close = completes_close;
             } else if (control.size() != membership.row_stride) {
-                throw std::logic_error("compact control membership has ragged target spans");
+                // Only a constrained row completing its own close (output_session) has a span of
+                // another length; the later row runs in the next control unit. Any other ragged
+                // span is still an invariant violation.
+                if (!completes_close && !stride_completes_close) {
+                    throw std::logic_error("compact control membership has ragged target spans");
+                }
+                continue;
             }
             membership.lanes[membership.size]     = lane;
             membership.sequences[membership.size] = *request->sequence;
@@ -237,11 +246,15 @@ public:
                (!have_decode || previous_unit_was_decode);
     }
 
+    // With a prompt unit runnable the decode batch gets one round after each prompt unit, and
+    // more while `decode_owed` (EngineOptions::decode_share time not yet used).
     [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
-                                                   bool previous_unit_was_decode) const noexcept {
+                                                   bool previous_unit_was_decode,
+                                                   bool decode_owed = false) const noexcept {
         if (prefill_runnable) {
-            return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
-                                                            : ExecutionAction::Prefill;
+            return have_decode && (!previous_unit_was_decode || decode_owed)
+                       ? ExecutionAction::Decode
+                       : ExecutionAction::Prefill;
         }
         return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
     }

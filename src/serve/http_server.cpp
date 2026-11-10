@@ -4,6 +4,7 @@
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
+#include "serve/request_validation.h"
 
 #include <nlohmann/json.hpp>
 
@@ -191,6 +192,16 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
     return httplib::Server::HandlerResponse::Handled;
 }
 
+bool api_key_equal(std::string_view given, std::string_view api_key) noexcept {
+    unsigned char differ = given.size() == api_key.size() ? 0 : 1;
+    for (std::size_t index = 0; index < api_key.size(); ++index) {
+        const unsigned char byte =
+            index < given.size() ? static_cast<unsigned char>(given[index]) : 0;
+        differ |= static_cast<unsigned char>(byte ^ static_cast<unsigned char>(api_key[index]));
+    }
+    return differ == 0;
+}
+
 bool matches_bearer_credential(std::string_view authorization, std::string_view api_key) noexcept {
     if (api_key.empty()) { return false; }
     const auto is_whitespace = [](char value) { return value == ' ' || value == '\t'; };
@@ -218,7 +229,7 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
     }
     std::size_t end = authorization.size();
     while (end > position && is_whitespace(authorization[end - 1])) { --end; }
-    return authorization.substr(position, end - position) == api_key;
+    return api_key_equal(authorization.substr(position, end - position), api_key);
 }
 
 namespace {
@@ -294,6 +305,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+    configure_output_constraint_limits(options_.constraint_limits);
+    configure_max_request_json_depth(options_.max_request_json_depth);
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -463,7 +476,8 @@ void HttpServer::register_routes() {
             // -> x-api-key, ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer) both work.
             const bool bearer_ok =
                 matches_bearer_credential(req.get_header_value("Authorization"), options_.api_key);
-            const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
+            const bool x_api_key_ok =
+                api_key_equal(req.get_header_value("x-api-key"), options_.api_key);
             if (!bearer_ok && !x_api_key_ok) {
                 ApiError error;
                 error.status  = 401;

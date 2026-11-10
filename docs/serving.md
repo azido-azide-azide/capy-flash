@@ -71,6 +71,14 @@ uses `flash-next` with `--host-kv-mib 1024 --host-state-slots 2` (smaller RAM ca
   `--profile flash-next` on a 96 GB machine the two checks add up to about 75 GiB free at startup; `install.sh` fails
   below 70 GiB in total and warns below 70 GiB free (56 GiB for the 64 GB edition). The 27B needs no RAM beyond its
   context cache.
+- **CMA memory (Ubuntu 26.04, Linux 7.0).** The kernel may hold part of the RAM as CMA (`CmaTotal` / `CmaFree` in
+  `/proc/meminfo`; the kexec-handover scratch takes about 9 GiB on a 64 GiB machine). Free CMA counts in MemAvailable
+  but cannot be page-locked, and pinning more than the RAM outside it stalls the load in reclaim until systemd-oomd
+  kills the server (#40). Without `--host-pinned-max-gib` the server caps the page-locked weights at the available RAM
+  outside CMA minus max(2 GiB, 5 % of MemTotal) and 8 GiB for its other page-locked buffers, keeps the rest of the
+  expert banks in pageable RAM (slower on those layers) and prints the cap; the Host tier check also leaves CMA out.
+  To page-lock everything, boot with `kho=off` (or `cma=0`) on the kernel command line. `NINFER_RAM_GUARD=0` turns
+  the cap off together with the RAM check.
 - **Context cache in RAM (Host KV and Host StateImages).** On one GPU (`--tp 1`) they are on by default: 8 Host
   StateImages and 8 GiB of pinned Host KV. At `--tp 2` an unset `--host-kv-mib` or `--host-state-slots` becomes 0.
   The profiles set them: `flash-next` 4096 MiB + 8 states, `flash-next-1gpu` 1024 MiB + 8, `27b` 8192 MiB + 8,
@@ -80,6 +88,10 @@ uses `flash-next` with `--host-kv-mib 1024 --host-state-slots 2` (smaller RAM ca
   banks of the least used layers stay in pageable RAM: the CPU reads them in place and the GPUs copy them through a
   pinned staging ring (no prefill streaming for those layers). Same tokens as fully pinned, slower where pageable.
   `--host-pinned-max-gib G` (or `NINFER_HOST_PINNED_MAX_GIB`) sets the cap by hand.
+  The value must be a complete, finite positive number of GiB representing at least one byte
+  and less than 16 EiB. Fractional bytes are truncated; invalid values are rejected.
+  Loading fails if weights that must stay pinned (such as host-mapped embeddings) exceed the
+  remaining budget after active Host KV reservations; they cannot fall back to pageable RAM.
 
 ### Chat template
 
@@ -332,7 +344,10 @@ The endpoint supports:
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
-- `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
+- `n:1` and text-only `modalities`;
+- structured output: `response_format` `text`, `json_object` and `json_schema`, and the
+  `structured_outputs` extension (`grammar`, `regex`, `choice`); see
+  [Structured output](#structured-output);
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
@@ -346,14 +361,15 @@ The endpoint supports:
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
+behavior. This includes nonzero `logit_bias`, requested log probabilities,
 audio/file input or audio output, `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
-Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
-`guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
-as unknown hints.
+The constrained-decoding spellings of other servers (`guided_json`, `guided_regex`, `guided_choice`,
+`guided_grammar`, and a non-empty llama.cpp `grammar`) are rejected with
+`constrained_decoding_not_supported` instead of being treated as unknown hints; an empty `grammar`
+stays neutral. Use `response_format` or `structured_outputs`.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,
@@ -676,7 +692,8 @@ wire response contains typed `output` Items.
 | `reasoning.summary` | omitted or `auto`, `concise`, `detailed`; accepted and ignored — this model writes no summaries and clients tolerate their absence |
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
-| `text.format` | omitted or `{"type":"text"}` only |
+| `text.format` | omitted, `{"type":"text"}`, `{"type":"json_object"}`, or `{"type":"json_schema","name":...,"schema":{...}}` (optional `description`, `strict`); returned as received in the Response object; see [Structured output](#structured-output) |
+| `structured_outputs` | NInfer extension: exactly one of `grammar`, `regex`, `choice`; see [Structured output](#structured-output) |
 | `tools` | direct function or custom tool definitions, or namespace groups containing them; a `custom` tool's free-form `input` travels as one required string parameter (a `grammar` format renders as prompt text); hosted `web_search` and `web_search_preview` entries are dropped from the prompt; other hosted or client-executed types (`file_search`, `code_interpreter`, `computer_use`, `local_shell`, ...) are rejected; see below |
 | `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
@@ -908,7 +925,7 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, Structured Outputs/JSON mode, `include` values beyond `reasoning.encrypted_content`,
+moderation, `include` values beyond `reasoning.encrypted_content`,
 background execution, compaction, files/audio, hosted tools other than web search, and remote MCP
 tools. These are compatibility boundaries, not silently accepted placeholders.
 
@@ -1002,7 +1019,12 @@ emits `message_start` after Engine admission commits the prefix selection and be
 transfer/prefill output, so its uncached/cache-read split is already exact; terminal cumulative
 usage matches the aggregate response.
 
-Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
+`output_config.format: {"type":"json_schema","schema":{...}}` constrains the response text to the
+schema, and the `structured_outputs` extension is accepted as in Chat Completions; see
+[Structured output](#structured-output). Without a `param` field in Anthropic errors, the location
+of a structured-output error leads its message (`output_config.format.schema/properties/x: ...`).
+
+Documents, Search Results, Files, server-tool results, container uploads, and
 other execution-dependent blocks are rejected with the missing capability identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
 fields do not block an otherwise executable request. The request `model` is any non-empty local
@@ -1025,6 +1047,174 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+## Structured output
+
+A constrained request limits the response content to a language: one JSON Schema, any JSON object,
+a GBNF grammar, a regular expression, or a list of literal strings. Before every decode round a
+per-request matcher (XGrammar, vendored in `third_party/xgrammar`) computes the tokens that keep the
+content in the language; sampling, MTP verification and the bonus token draw only from them, so a
+response that ends with the model's stop token is in the language. Requests without a constraint run
+exactly as before.
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.8-27b",
+    "messages": [{"role": "user", "content": "Weather in Rome, as JSON."}],
+    "response_format": {"type": "json_schema", "json_schema": {"name": "weather", "schema": {
+      "type": "object",
+      "properties": {
+        "condition": {"enum": ["sunny", "cloudy", "rain"]},
+        "celsius": {"type": "number", "minimum": -60, "maximum": 60}
+      },
+      "required": ["condition", "celsius"],
+      "additionalProperties": false}}}
+  }'
+```
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Is the sky blue?"}],
+       "structured_outputs": {"choice": ["yes", "no"]}}'
+```
+
+```bash
+curl http://127.0.0.1:8080/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3.8-27b", "max_tokens": 512,
+       "messages": [{"role": "user", "content": "Invent a user, as JSON."}],
+       "output_config": {"format": {"type": "json_schema", "schema": {"type": "object",
+         "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+         "required": ["name", "age"], "additionalProperties": false}}}}'
+```
+
+### Request fields
+
+| Endpoint | Field | Constraint | Error `param` |
+|---|---|---|---|
+| Chat Completions | `response_format: {"type":"json_object"}` | any JSON object | `response_format` |
+| Chat Completions | `response_format: {"type":"json_schema","json_schema":{"name":N,"schema":S}}`, optional `description`, `strict` | schema `S` | `response_format.json_schema.schema` + JSON Pointer |
+| Responses | `text.format: {"type":"json_object"}` | any JSON object | `text.format` |
+| Responses | `text.format: {"type":"json_schema","name":N,"schema":S}`, optional `description`, `strict` | schema `S` | `text.format.schema` + JSON Pointer |
+| Messages | `output_config.format: {"type":"json_schema","schema":S}` | schema `S` | `output_config.format.schema` + JSON Pointer |
+| all three | `structured_outputs: {"grammar": G}` (NInfer extension) | GBNF `G`, root rule `root` | `structured_outputs.grammar` |
+| all three | `structured_outputs: {"regex": R}` | regular expression `R`, whole content | `structured_outputs.regex` |
+| all three | `structured_outputs: {"choice": [...]}` | exactly one of the strings | `structured_outputs.choice` |
+
+OpenAI `name` is 1 to 64 letters, digits, `_` or `-`. `strict` may be `true`, `false` or `null`: the
+schema is enforced either way. Responses returns `text.format` as received, in the Response object
+and in `response.created`. The token-count endpoints accept the format fields and ignore them.
+
+JSON Schema: drafts 2020-12 and 07, keywords `type`, `properties`, `required`,
+`additionalProperties`, `items`, `prefixItems` (`additionalItems` in draft 07), `minItems`,
+`maxItems`, `minLength`, `maxLength`, `pattern`, `minimum`, `maximum`, `exclusiveMinimum`,
+`exclusiveMaximum`, `const`, `enum`, `anyOf`, `oneOf`, `allOf`, local `$ref` with `$defs` or
+`definitions`; annotations such as `title`, `description`, `default` and `examples` are ignored.
+Any other keyword (`format`, `uniqueItems`...) is a 400 `unsupported_json_schema` at its JSON
+Pointer; a schema that no value satisfies is `unsatisfiable_json_schema`; a number whose JSON
+spelling a double cannot keep (`0.30000000000000001`) is `unsupported_json_schema`. GBNF follows
+XGrammar's EBNF without budgets, captures, lazy rules, temperature or token references. Regular
+expressions have no backreferences or lookaround. A grammar, regex or schema whose language has no
+first token (`[^\s\S]`, an empty character class) is refused before generation.
+
+**Strict objects (default).** Like vLLM and SGLang (XGrammar's `strict_mode`), an object that
+declares `properties` and says nothing about `additionalProperties` admits only the declared keys,
+and after a tuple (`prefixItems`, or a draft-07 `items` array) without `items`/`additionalItems` no
+further items follow. This differs from literal JSON Schema, where such objects and tuples are open:
+the model cannot add a key the schema did not declare. Everything written explicitly keeps its
+meaning: `additionalProperties: true` admits any extra key, `additionalProperties: {schema}` extra
+keys with values of that schema, `items` the items it describes; an object without declared
+properties (`{"type":"object"}`, with or without a description) and an array without a tuple stay
+open; `allOf` closes to the union of the properties its branches declare. `json_object` is any
+object. `--constraint-json-strict off` restores literal JSON Schema. Open objects with declared
+properties are expensive for the matcher when the model adds keys (56-95 ms per token mask
+measured), so a request with `additionalProperties` (`true` or a schema) next to declared properties
+can end with `constraint_budget_exceeded`; close the object if that happens. In strict mode a tuple
+(`prefixItems`) without `items` is closed, so a `minItems` larger than the tuple makes the schema
+unsatisfiable (HTTP 400): add `items`, or use `--constraint-json-strict off`.
+
+With thinking on, only the content is constrained: the reasoning stays free until the canonical
+`\n</think>\n\n` close, then the content follows the constraint; the thinking budget applies as
+usual. Unless the client sets `presence_penalty`, a constrained request uses `0` instead of the
+model preset or `--presence-penalty`, which would push the model away from repeated JSON
+punctuation. One request carries at most one constraint, and a constraint cannot be combined with
+custom stop strings (`stop`, `stop_sequences`), active tools (`tool_choice:"none"` keeps declared
+tools inactive) or an Anthropic Assistant prefill: these are 400 `unsupported_output_combination`
+(`assistant_prefill_not_supported` for the prefill).
+
+### Errors
+
+| Code | Status | When |
+|---|---:|---|
+| `invalid_json_schema`, `unsupported_json_schema`, `unsatisfiable_json_schema` | 400 | the schema is malformed, uses an unsupported keyword, or accepts no value; `param` ends with the JSON Pointer |
+| `invalid_grammar`, `invalid_regex`, `invalid_choice` | 400 | the source does not parse, or its language is empty |
+| `unsupported_output_combination` | 400 | two constraints, or a constraint with stop strings or active tools |
+| `constraint_limit_exceeded` | 400 | an input over a [limit](#structured-output-limits) or a compilation over its time limit; the message names the flag |
+| `server_overloaded` | 429 | no compilation slot became free within `--constraint-compile-wait-ms` (the server is busy compiling other schemas; retry) |
+| `constraint_dead_end` | 400 | during generation no token can continue the content |
+| `constraint_budget_exceeded` | 400 | during generation the matcher exceeded its time or memory budget; only this request ends |
+
+Errors found before generation are ordinary HTTP errors. The last two happen while generating: a
+non-streamed request returns the error instead of a response; a stream that has already sent its
+200 ends with the protocol's error event (Chat `data: {"error":...}`, Responses
+`event: response.failed` with the code in `response.error`, Anthropic `event: error`), and the
+content streamed until then is incomplete.
+
+### Structured output limits
+
+A schema or grammar comes from the client, so its cost does too. The server bounds it at every
+step, and a request over a bound fails alone with a 400 that names the flag; other requests and the
+server are unaffected:
+
+| Option | Bounds | Default |
+|---|---|---:|
+| `--constraint-max-kib N` | size of a JSON Schema (serialized), a GBNF grammar or a regex, or the total bytes of a choice list, in KiB | `256` |
+| `--constraint-max-depth N` | nesting of the schema document (objects and arrays), group nesting of GBNF and regex; `1..1000` | `256` |
+| `--constraint-max-items N` | members of one object or array of the schema (properties, `enum` values, `anyOf` branches...), choice entries, GBNF rules | `4096` |
+| `--constraint-compile-timeout-ms N` | wall time of one compilation, from the moment it holds a slot; `0` = none | `5000` |
+| `--constraint-compile-concurrency N` | compilations at the same time (a cached grammar takes no slot); `0` = no limit | `2` |
+| `--constraint-compile-wait-ms N` | wait for a compilation slot, first come first served; beyond it the request gets 429 `server_overloaded` (the server is busy compiling, not the schema too complex); `0` = no limit | `30000` |
+| `--constraint-cache-mib N` | LRU cache of compiled grammars | `64` |
+| `--constraint-round-budget-ms N` | matcher CPU time of one request in one decode round (masks of all positions, or the accept of its tokens); the wall clock is checked at 5× as a safety net; `0` = none | `20` |
+| `--constraint-request-budget-ms N` | matcher CPU time of one request in total: `N` plus `--constraint-round-allowance-ms` per round; `0` = none | `1000` |
+| `--constraint-round-allowance-ms N` | see above | `5` |
+| `--constraint-matcher-mib N` | memory of one request's matcher history; `0` = none | `512` |
+| `--constraint-json-strict on\|off` | strict JSON Schema objects and tuples (below); `off` = literal JSON Schema | `on` |
+
+The size, depth and item limits are checked in the HTTP layer on the parsed request, before
+anything recursive reads the schema, and again before compilation for Engine users. Compilation
+runs in the request's HTTP thread on at most `--constraint-compile-concurrency` CPU cores, under the
+timeout, which starts when the compilation holds a slot and covers every phase (`allOf`/`$ref`
+normalization, schema conversion, the token-mask cache). Requests wait for a slot in arrival order,
+for at most `--constraint-compile-wait-ms`: someone else's slow schemas can delay a compilation,
+not make it fail as too complex; it gives its memory back to the system when it was
+large or failed, and a failed compilation is not cached. A conjunction (`allOf`, `$ref`) expands to
+at most `--constraint-max-items` subschemas; a reference reached again through another branch adds
+nothing. During generation the matcher runs on the Engine thread before each round, so an
+expensive one would slow every request in the batch: the round and request budgets stop that
+request instead, and the memory bound stops an ambiguous grammar whose matcher state grows with the
+square of the output. The budgets count the CPU time of the Engine thread, so a busy machine
+(Flash-Next's expert threads, other processes) does not make a legitimate grammar fail.
+
+Ordinary schemas stay far from these limits: a mask costs about 5 µs per position (1 µs to 0.7 ms
+for the schemas measured), and the matcher history grows by about 1 KB per output token. What does
+reach them: deeply nested or very large schemas, many optional properties (compilation grows with
+their square: 500 take 1.6 s, 1000 exceed the 5 s timeout; prefer `required`), and ambiguous
+grammars or patterns such as `e ::= e e | "a"`, `(a*)*`, `((a|b)*)*` or `^(.*a){20}$`, whose matcher
+work grows with the output.
+
+### Cost
+
+On Qwen3.8-27B (tp 2, MTP 3) an ordinary schema costs about 18 µs of host work per round, 0.3 % of
+the round; on Flash-Next the difference is below run-to-run noise. The first request with a new
+constraint compiles it (milliseconds for typical schemas, up to seconds near the limits) and the
+first constrained request of a server builds the vocabulary index once (about 0.1 s); later requests
+with the same constraint use the cache. With DFlash2 a constrained request decodes without drafts
+(ordinary rounds), so it is slower than an unconstrained one; the other requests of the batch keep
+drafting.
 
 ## Authentication and CORS
 
@@ -1061,7 +1251,8 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--vram-headroom-mib N` | VRAM in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto` | `1024` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
-| `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
+| `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` (10 minutes) |
+| `--decode-share F` | while a request's prompt runs, the requests already decoding get `F` times the time of each prompt unit (at least one decode round per unit). `0` keeps one round per unit: with Flash-Next a prompt unit of 16k tokens takes several seconds, during which the others produce almost nothing; `1` gives both equal time. Measured (Flash-Next, 2 GPUs, one request decoding while a 48k prompt arrives): the decoding request gets 1.7 / 41.8 / 71.0 tokens/s during that prompt with `0` / `0.5` / `1`, and the prompt's first token comes after 10.2 / 14.7 / 19.5 s. A prompt unit is not split: with 16k-token units the decoding requests still wait about 3.3 s per unit | `0` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--kv-lease-window N` | output tokens of Device KV a request reserves beyond its prompt (or the prefill chunk, if larger), extended as the answer grows; `0` reserves the whole `max_tokens` at admission | `4096` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
@@ -1071,9 +1262,22 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--devices A,B` | one CUDA device per rank, rank 0 first; required with `--tp 2` | `--device` |
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
+| `--max-request-json-depth N` | nesting of objects and arrays in a request body and in tool-call `arguments` strings, checked on the bytes before parsing; deeper is a 400 `request_json_too_deep`; `1..5000` | `1000` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
+| `--constraint-max-kib N` | structured output: size of a schema, grammar, regex or choice list, in KiB ([limits](#structured-output-limits)) | `256` |
+| `--constraint-max-depth N` | structured output: schema nesting, GBNF/regex group nesting; `1..1000` | `256` |
+| `--constraint-max-items N` | structured output: members of one schema object or array, choice entries, GBNF rules | `4096` |
+| `--constraint-compile-timeout-ms N` | structured output: wall time of one compilation, from the moment it holds a slot; `0` = none | `5000` |
+| `--constraint-compile-wait-ms N` | structured output: wait for a compilation slot (first come, first served), then 429; `0` = no limit | `30000` |
+| `--constraint-compile-concurrency N` | structured output: compilations at the same time; `0` = no limit | `2` |
+| `--constraint-cache-mib N` | structured output: compiled grammar cache | `64` |
+| `--constraint-round-budget-ms N` | structured output: matcher CPU time of one request per decode round; `0` = none | `20` |
+| `--constraint-request-budget-ms N` | structured output: matcher CPU time of one request, plus `--constraint-round-allowance-ms` per round; `0` = none | `1000` |
+| `--constraint-round-allowance-ms N` | structured output: per-round addition to the request budget | `5` |
+| `--constraint-matcher-mib N` | structured output: memory of one request's matcher history; `0` = none | `512` |
+| `--constraint-json-strict on\|off` | structured output: an object with declared properties and no `additionalProperties` admits only those keys, a tuple without `items` no more items (as vLLM/XGrammar); `off` = literal JSON Schema | `on` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--log-speculation-detail` | add the per-step accepted draft lengths and the output/prompt 4-gram overlap to every `request_done` record (test measurement; requires `--request-log-jsonl`); see [Structured request log](#structured-request-log) | off |
 | `--log-speculation-detail-max-steps N` | decode steps recorded per request by `--log-speculation-detail` (`1..1048576`); a longer request is marked truncated | `4096` |
@@ -1082,6 +1286,8 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash2 `1..15` | unset |
+| `--rope-yarn-factor F` | YaRN RoPE context extension, `[1,4]`: raises the accepted `max-context` ceiling to native × F (native stays 262,144). `1` installs nothing and leaves greedy output byte-identical; above 1 it costs perplexity and is experimental. Opt-in, ported from @splickz's work ([#28](https://github.com/ValerioDolci/capy-flash/issues/28), [PR #29](https://github.com/ValerioDolci/capy-flash/pull/29)) | `1.0` |
+| `--rope-original-max-position N` | the native window YaRN scales from, used only when `--rope-yarn-factor` > 1 | `262144` |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
@@ -1106,10 +1312,10 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--turn-anchors N` | private long-anchor opportunities at the last N message boundaries before the final message, so a cancelled or edited turn resumes from the end of the previous turn instead of re-prefilling the conversation (`0` disables). Protocol cache markers win the shared marker budget: with a request already carrying four `cache_control` breakpoints the anchor is dropped rather than pushing the request over the limit. Default by model: `0` on Qwen3.8-Flash-Next (each anchor costs one extra prefill pass per turn, ~0.8 s there), `1` on the others, where the extra pass is not measurable | `0` Flash-Next, `1` others |
-| `--elastic` | Qwen3.8-Flash-Next with offloaded experts: the KV pool keeps its address space for `--max-context` but backs pages on demand, and the VRAM it does not use becomes extra expert slots, given back when the KV grows; no effect on models without offloaded experts | off (on in `--profile flash-next` and `flash-next-1gpu`) |
+| `--elastic` | Qwen3.8-Flash-Next with offloaded experts: the KV pool keeps its address space for `--kv-capacity` (every request together) but backs pages on demand, and the VRAM it does not use becomes extra expert slots, given back when the KV grows; no effect on models without offloaded experts | off (on in `--profile flash-next` and `flash-next-1gpu`) |
 | `--kv-grow N` | with `--elastic`: step, in tokens, in which the KV backing starts and grows; must be positive | `8192` |
-| `--kv-ram-active` | Qwen3.8-Flash-Next, one request at a time: the K/V of the text attention layers lives in pinned host RAM instead of VRAM (only the QSA indexer's block keys stay on the GPU, 0.75 KiB per token per GPU instead of 10-16 KiB). Each decode step copies the blocks the indexer selected into a VRAM block cache (only the ones not already there cross PCIe), and each prompt chunk copies one layer of the visible context at a time; results are identical to the default. The VRAM this frees goes to routed-expert slots (with `--elastic`). It costs pinned RAM for the whole pool and a fixed VRAM region of one layer of `--max-context` ([sizes and rates](maintainer/active-kv-in-ram.md#cost)) | off |
-| `--kv-budget-gib G` | with `--elastic`: at most `G` GiB of KV per GPU (Text and MTP pools); the base expert slots are sized for it instead of `--max-context`'s KV, and a request that needs more KV fails. Keeps more experts resident when contexts stay short | unset (sized for `--max-context`) |
+| `--kv-ram-active` | Qwen3.8-Flash-Next: the K/V of the text attention layers lives in pinned host RAM instead of VRAM (only the QSA indexer's block keys stay on the GPU, 0.75 KiB per token per GPU instead of 10-16 KiB). Works with any `--max-concurrency`: each decode step copies the blocks the indexer selected for every request into a shared VRAM block cache (only the ones not already there cross PCIe), and each prompt chunk copies one layer of the visible context at a time; results are identical to the default. The RAM is taken 8,192 tokens at a time as conversations grow and given back when they end, up to `--kv-capacity` tokens (which the page-locked limit reserves from the start); the VRAM this frees goes to routed-expert slots (with `--elastic`) or to more concurrent context. It costs a fixed VRAM region of one layer of `--max-context`, at most 262,144 tokens (longer contexts copy only the blocks each prompt chunk selects) ([sizes and rates](maintainer/active-kv-in-ram.md#cost)) | off |
+| `--kv-budget-gib G` | with `--elastic`: at most `G` GiB of KV per GPU (Text and MTP pools, every request together); the base expert slots are sized for it instead of `--kv-capacity`'s KV, and a request that needs more KV fails. Keeps more experts resident when contexts stay short | unset (sized for `--max-context`) |
 | `--miss-split auto\|calibrate\|off` | Qwen3.8-Flash-Next: `auto` lets the GPU read part of each decode window's missing experts over PCIe in parallel with the CPU, choosing the share from fixed costs fitted on a Ryzen 9 9900X; `calibrate` does the same with costs measured on this machine: at startup it times how fast the GPU copies an expert over PCIe, then the first 4,096 decode calls keep every missing expert on the CPU while their time is fitted (fixed + per expert + per extra column, at the configured CPU threads), and the measured costs replace the built-in ones for the rest of the run. Both steps print a `miss split calibrate` line. `off` leaves them all to the CPU. Forced off with GGUF expert banks (the 64 GB edition) | `off` |
 | `--stream-min-tokens N` | Qwen3.8-Flash-Next: prompt chunks of at least `N` tokens stream the non-resident experts to the GPU over PCIe, shorter chunks compute them on the CPU; `0` never streams. With GGUF expert banks it is the threshold from which the prefill reads them in place from host RAM | `256` |
 | `--expert-cpu-threads N` | Qwen3.8-Flash-Next: CPU threads of the experts that miss the VRAM cache (`1..64`, at most the allowed physical cores, otherwise startup fails); see [CPU expert threads](#cpu-expert-threads) | automatic, logged at startup |
@@ -1173,6 +1379,9 @@ such as a system prompt another conversation left, made the long conversation pr
   state per turn.
 - One directory per server: `DIR/.lock` is held for the life of the process; a second server on the
   same directory does not start and names the process that holds it.
+- The manifests hold the conversations' tokens, so the cache is private to the server's user: `DIR/m`
+  and `DIR/b` are set to 0700 at start (which also covers files an older version wrote 0644) and new
+  files are created 0600, whatever the umask.
 - Space: at most `--disk-cache-gib` (least recently used conversations go first, with the blocks only
   they use; blocks of an interrupted save are reused by the next attempt or deleted at the next start),
   and the file system always keeps `--disk-cache-min-free-gib` free (default max(10 GiB, 5 % of the file
@@ -1273,7 +1482,12 @@ multi-conversation servers should set `--device-state-slots 12` to `16` when mem
 limitations in the README). The startup log prints one
 line per rank and a `tensor parallel` capacity line with the Device checkpoint pool and the
 transfer path: `p2p on` when the driver grants direct peer access, `p2p off (host-staged copies)`
-otherwise (GeForce boards). With CUDA Graphs one `cuda graphs` line per rank compares the device
+otherwise (GeForce boards). When the driver advertises peer access but cannot map the peer's
+memory, the server prints why and starts with `p2p off` (#41). Under VFIO passthrough this happens
+with the default 256 MiB BAR1 (`cudaErrorMapBufferObjectFailed`): QEMU exposes the size the host BAR
+has, so grow it on the hypervisor with the VM off (for example
+`echo 14 > /sys/bus/pci/devices/<gpu>/resource1_resize`, 16 GiB, with Above 4G Decoding and Resizable
+BAR enabled in the BIOS) and `p2p on` follows. With CUDA Graphs one `cuda graphs` line per rank compares the device
 memory graph preparation took with the planned per-device allowance, and a warning follows if a
 rank took more; startup still succeeds, the excess coming out of the memory KV sizing left free.
 The tp 2 allowance is three times what two RTX 5070 Ti measured at 32K context and
@@ -1417,7 +1631,8 @@ under [OpenAI Chat Completions](#openai-chat-completions)). Fallback reasons are
 the operational log. These counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
-as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
+as full-precision JSON numbers. `request_done.speculative` is a separate top-level object of the
+record, next to `timings_seconds` (not inside it): it contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position`, and
 `accepted_length_histogram`. A round is one verification of a nonempty draft; `fallback_steps` are
 decode steps without a draft. `accepted_per_position[i]` counts the rounds that accepted at least
@@ -1428,7 +1643,7 @@ speculative backend. A round whose draft was cut short by the remaining output b
 the length it actually accepted. Rates can be derived downstream from raw token counts and seconds
 instead of rounded stderr strings.
 
-`speculative.accepted_lengths` is the order behind that histogram, recorded only with
+`request_done.speculative.accepted_lengths` is the order behind that histogram, recorded only with
 `--log-speculation-detail` (otherwise it and `accepted_lengths_truncated` are `null`). It is a
 string with one character per decode step in execution order: the hexadecimal digit of the draft
 tokens that round accepted (`0` to the draft window, at most `f` = 15), or `-` for a step without a
@@ -1537,10 +1752,19 @@ CPU/media preparation and completed model results whose response has not yet bee
 capacity returns HTTP 429 with code `server_overloaded`. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
+The 10-minute default covers a queue of long prompts, which are prefilled one at a time (a
+120k-token Flash-Next prompt takes about 31 s on two 16 GB GPUs), and a request waiting behind
+a long answer at `--max-concurrency 1`; it is also the default timeout of the OpenAI and Anthropic
+SDKs, so the server does not give up before a client using them. Lower it for clients that
+should fail fast.
 There is no admission ETA or unbounded overflow queue.
 
 Input memory is bounded by the outstanding-request count and the per-request
-`--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
+`--max-request-mib` limit. Input nesting is bounded by `--max-request-json-depth` (default 1000):
+the body, and the JSON that tool-call `arguments` carry as strings, are scanned before any parser
+sees them, because the prompt path (chat-template rendering in particular) walks client JSON
+recursively; about 12 000 levels would exhaust an 8 MiB thread stack and stop the server. A deeper
+request fails alone with HTTP 400 `request_json_too_deep`, on every endpoint that takes a JSON body. Media requests additionally share one preparation permit, so a waiting
 media request retains the same cancellation and timeout deadline. Model output is bounded by the
 same finite request count and each request's effective output-token limit; output callbacks and
 network serialization run outside the GPU executor and do not delay formation of the next batch.
@@ -1596,8 +1820,8 @@ a following compatible turn can reuse it. Output-limit and context-capacity fini
 `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+responses. NInfer does not execute tools and does not constrain tool calls to their JSON Schema;
+[structured output](#structured-output) constrains the response content only.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

@@ -15,11 +15,11 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 - **Qwen3.8-27B** is a dense model that runs entirely on the GPUs.
 - For agents: a prefix cache across turns, idle conversations moved to RAM (and optionally to disk) instead of being
   recomputed, and the expert cache follows the conversation. For long contexts Flash-Next can also keep the KV cache
-  of the conversation being generated in RAM (`--kv-ram-active`).
+  of the conversations being generated in RAM (`--kv-ram-active`), with one request or several at once.
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.8.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.10.0**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -97,6 +97,23 @@ set the key without putting it on the command line.
 
 Details, including authentication and what each client sends: [docs/serving.md](docs/serving.md#connect-a-client).
 
+**Structured output.** `response_format` (`json_object`, `json_schema`) on Chat Completions, `text.format` on
+Responses, `output_config.format` on Messages, and the `structured_outputs` extension (`grammar`, `regex`, `choice`)
+constrain the answer: the reply is valid JSON for the schema (or matches the grammar, regex or choice) whenever the
+model ends it. With thinking on, only the answer after `</think>` is constrained.
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "capy-flash", "messages": [{"role": "user", "content": "A cat, as JSON."}],
+  "response_format": {"type": "json_schema", "json_schema": {"name": "cat", "schema": {"type": "object",
+    "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}, "required": ["name", "age"]}}}}'
+```
+
+Schemas and grammars come from the client, so they are bounded: size, nesting and item limits before compilation, a
+compilation timeout, and a time and memory budget while generating (`--constraint-*` flags). A request over a limit
+fails alone with a 400 that names the flag; the other requests keep their speed. Fields, errors, limits and cost:
+[docs/serving.md](docs/serving.md#structured-output).
+
 ## Run it other ways
 
 ### Build
@@ -125,9 +142,12 @@ order. `ninfer-serve --help` and [docs/serving.md](docs/serving.md#profiles) lis
 For the 64 GB edition on two GPUs add `--host-kv-mib 1024 --host-state-slots 2` to `--profile flash-next` (smaller RAM
 caches); `install.sh --model flash-next-64gb` prints that command.
 
-For long contexts on Flash-Next, add `--kv-ram-active` to either Flash-Next profile: the KV cache stays in pinned RAM
-(2.3 GiB per GPU at 262k tokens, 3.9 GiB on one GPU) and the VRAM it frees goes to expert slots. Same tokens; a few
-per cent slower on short contexts, faster on long ones ([costs](docs/maintainer/active-kv-in-ram.md#cost)).
+For long contexts on Flash-Next, add `--kv-ram-active` to either Flash-Next profile: the KV cache stays in pinned RAM,
+taken as the conversations grow (about 2.5 GiB per GPU for 262k tokens, 4.2 GiB on one GPU), and the VRAM it frees
+goes to expert slots. Same tokens; within a few per cent of the default speed
+([costs](docs/maintainer/active-kv-in-ram.md#cost)). For several long conversations at once add
+`--max-concurrency N --kv-capacity T` (T tokens for all of them together; the RAM follows what they use). Prompts are
+prefilled one at a time: a request waits at most `--pending-timeout-ms` (default 10 minutes) for the others.
 
 ### Docker
 [docker/Dockerfile.release](docker/Dockerfile.release) packs a release tarball (builds in about a minute; the root
@@ -256,9 +276,13 @@ tasks of a private task bank, 4 runs each, OpenCode with the model's sampling: 2
 run (Strata 0.1.43 IQ3_S on the same tasks: 52.7k, 20/20; the GB300 reference: 26.5k), no malformed tool call in 1,124.
 
 ## Known limits
-- Flash-Next is tested with one request at a time (`--max-concurrency 1`, as its profiles set) and only on the
-  machine above; `--kv-ram-active` requires it. The server accepts up to 8 (`--max-concurrency`); the 27B NVFP4 was
-  measured at 1 to 8.
+- Flash-Next's profiles serve one request at a time (`--max-concurrency 1`) and only the machine above is tested. With
+  `--max-concurrency 2` to `4` (with or without `--kv-ram-active` and `--elastic`) the decode of the requests is
+  batched: two requests of 32k-100k tokens decode 1.2-1.4x the tokens per second of one, four only 1.1-1.2x (four
+  MTP windows exceed the 8-token fast path of the expert kernels; with `--draft-tokens 1` four requests decode
+  1.3x the tokens of one request with MTP 3, at the cost of 10 % for a request alone). RAM is the limit: with Flash-Next loaded about
+  10 GB of the 96 GB stay free, about 400k tokens of int8 KV in RAM at tp 2. The server accepts up to 8
+  (`--max-concurrency`); the 27B NVFP4 was measured at 1 to 8.
 - With several requests decoding, an answer that outgrows its KV window when the GPUs are full first moves idle cached
   conversations to RAM (or drops them without a RAM tier); only if that cannot free a page does it end early with
   `finish_reason: length` (the request log counts it). `--kv-lease-window 0` restores the full reservation of v0.5.3.
@@ -281,6 +305,54 @@ artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.10.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.10.0))
+- Structured output ([#17](https://github.com/ValerioDolci/capy-flash/issues/17)): JSON mode, JSON Schema, GBNF
+  grammars, regex and choice lists on Chat Completions (`response_format`, `structured_outputs`), Responses
+  (`text.format`) and Anthropic Messages (`output_config.format`), streaming included, with MTP and next to other
+  requests. Objects are strict by default as in vLLM (`--constraint-json-strict off` for literal JSON Schema); every
+  client input is bounded (`--constraint-*`). Cost on the 27B: +0.3 % per round. See
+  [docs/serving.md](docs/serving.md#structured-output). Unconstrained requests are served as in v0.9.0.
+- `--pending-timeout-ms` defaults to 10 minutes (was 30 s): queued requests behind long prompts are no longer refused.
+- Fixed: a request body nested very deeply (for example a tool schema) crashed the server; beyond
+  `--max-request-json-depth` (default 1000) it now gets a 400.
+- Grouped MoE metadata in one scan ([PR #52](https://github.com/ValerioDolci/capy-flash/pull/52) by @lupodevelop).
+
+**v0.9.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.9.0))
+- Opt-in, nothing changed at the default (greedy output identical to v0.8.2).
+- `--kv-ram-active` (Flash-Next) now serves several requests at once, with or without `--elastic`; its RAM grows
+  with the conversations and is given back when they end; the MTP layer's KV is in RAM too; beyond 262k tokens the
+  VRAM region no longer grows. Three coding agents at once: 171 s with it against 274 s with the KV in VRAM
+  (`--max-concurrency 3 --draft-tokens 1`) and 180 s one at a time, first token after 1.8 s instead of 8.1 s.
+- `--decode-share F`: the requests already decoding keep a share of the time while a new prompt runs.
+- Fixed: `--elastic` with a `--kv-capacity` above `--max-context` could run out of device memory; a failed elastic
+  growth no longer leaves unzeroed memory mapped, and host-memory copies work inside CUDA Graph capture
+  ([PR #49](https://github.com/ValerioDolci/capy-flash/pull/49), [PR #50](https://github.com/ValerioDolci/capy-flash/pull/50)
+  by @lupodevelop).
+
+**v0.8.2** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.2))
+- Two opt-in community contributions, nothing changed at the default (greedy output identical to v0.8.1).
+- Long context with YaRN: `--rope-yarn-factor F` (1-4) raises the accepted `--max-context` to native × F,
+  up to 1,048,576 tokens on Flash-Next (`--kv-dtype nvfp4` on two 16 GB cards). Experimental; 4× costs
+  perplexity. @splickz's work, ported and measured by @Hazelhof
+  ([#28](https://github.com/ValerioDolci/capy-flash/issues/28), [PR #29](https://github.com/ValerioDolci/capy-flash/pull/29)).
+- A portable benchmark, `bench/capy_flash/ladder.py`: one command, a fixed prefill/decode ladder with the
+  machine and the server's P2P state recorded, so rows compare across setups
+  ([#30](https://github.com/ValerioDolci/capy-flash/issues/30), by @Zeppe79).
+
+**v0.8.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.1))
+- Fixes and hardening, same tokens and speed as v0.8.0. Recommended for everyone.
+- Flash-Next no longer hangs at «loading weights» on kernels that keep part of the RAM as CMA (Ubuntu 26.04):
+  the page-locked experts stay outside it and the rest goes to pageable RAM
+  ([#40](https://github.com/ValerioDolci/capy-flash/issues/40)). Two GPUs that advertise peer access but cannot
+  map it (a VM with a 256 MiB BAR1) now start with `p2p off` instead of aborting
+  ([#41](https://github.com/ValerioDolci/capy-flash/issues/41)).
+- `--host-pinned-max-gib` is validated and always enforced, and `install.sh` stops on a failed checksum
+  ([PR #44](https://github.com/ValerioDolci/capy-flash/pull/44), [PR #45](https://github.com/ValerioDolci/capy-flash/pull/45),
+  [PR #46](https://github.com/ValerioDolci/capy-flash/pull/46) by @lupodevelop).
+- Security: on a loopback address the server refuses cross-site and DNS-rebinding requests from web pages (`--cors`
+  turns that off); the disk tier is private to the server's user; the API key is compared in constant time; response
+  IDs are no longer predictable.
 
 **v0.8.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.0))
 - Before updating: Qwen3.5 MoE (Qwen3.6-35B-A3B) and DFlash v1 (`--spec dflash`) are no longer supported; stay on

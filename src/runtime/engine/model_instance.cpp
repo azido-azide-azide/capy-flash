@@ -263,7 +263,9 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
            .media_cache_bytes        = options.media_cache_bytes,
            .media_live_bytes         = options.media_live_bytes,
            .media_preprocess_threads = options.media_preprocess_threads,
-           .max_item_vision_tokens = options.max_vision_tokens.value_or(kMaximumMaxVisionTokens)})),
+           .max_item_vision_tokens   = options.max_vision_tokens.value_or(kMaximumMaxVisionTokens),
+           .grammar_cache_bytes      = options.constraint_limits.cache_bytes,
+           .constraint_limits        = options.constraint_limits})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;
@@ -374,9 +376,19 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
     if (const std::int64_t slot_bytes =
             models::qwen3_5::offloaded_expert_slot_bytes(instance->parameters, options);
         slot_bytes > 0 && options.elastic_kv.enabled) {
-        auto probe                = make_planner(planned_options);
-        const std::size_t kv_full = probe.kv_pool_bytes();
-        const std::uint32_t pages = probe.kv_pool_pages();
+        auto probe = make_planner(planned_options);
+        // The pool the Program gets: an explicit kv_capacity (above max_context with several
+        // requests), else the curve's minimum.
+        const runtime::SequenceCapacityCurve& curve = probe.capacity_curve();
+        const std::uint32_t pages =
+            options.kv_capacity.mode == KvCapacityMode::Explicit && curve.main_page_tokens != 0
+                ? std::max(curve.minimum_main_page_groups,
+                           static_cast<std::uint32_t>(
+                               (static_cast<std::uint64_t>(options.kv_capacity.explicit_tokens) +
+                                curve.main_page_tokens - 1U) /
+                               curve.main_page_tokens))
+                : probe.kv_pool_pages();
+        const std::size_t kv_full = probe.kv_pool_bytes(pages);
         const std::uint32_t step  = (options.elastic_kv.grow_tokens + 63U) / 64U;
         const std::size_t kv_init = pages == 0 ? kv_full : kv_full / pages * std::min(step, pages);
         elastic_unbacked          = kv_full - kv_init;

@@ -14,10 +14,17 @@ namespace ninfer::serve {
 
 // Protocol default when the client omits max_tokens. Engine independently
 // clamps the request to its effective context capacity.
-inline constexpr int kDefaultMaxTokens                    = 8192;
-inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
-inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
-inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
+inline constexpr int kDefaultMaxTokens               = 8192;
+inline constexpr std::size_t kDefaultMaxRequestBytes = 384ULL << 20;
+// Nesting of objects and arrays in a request body (and in JSON carried as a string, such as tool
+// call arguments), checked on the bytes before parsing: the prompt path reads client JSON with
+// recursive code (rendering, copies, serialization), so a deep document must not reach it.
+inline constexpr std::uint32_t kDefaultMaxRequestJsonDepth = 1000;
+// The template renderer converts client JSON recursively: about 12 000 levels exhaust an 8 MiB
+// thread stack (measured), so the maximum keeps a margin.
+inline constexpr std::uint32_t kMaximumMaxRequestJsonDepth = 5000;
+inline constexpr std::size_t kDefaultResponseStoreRecords  = 1024;
+inline constexpr std::size_t kDefaultResponseStoreBytes    = 256ULL << 20;
 // --log-speculation-detail records the accepted draft length of at most this many decode steps
 // per request (one byte each in the JSONL record) unless --log-speculation-detail-max-steps
 // changes it.
@@ -37,39 +44,51 @@ struct ServeOptions {
     KvCapacityPolicy kv_capacity         = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency        = 1;
     std::uint32_t max_pending_requests   = 16;
-    std::uint32_t pending_timeout_ms     = 30000;
+    std::uint32_t pending_timeout_ms     = kDefaultPendingTimeoutMs;
+    float decode_share                   = 0.0F; // --decode-share (EngineOptions::decode_share)
     std::uint32_t prefill_chunk          = 1024;
     std::uint32_t kv_lease_window_tokens = 4096; // --kv-lease-window; 0 = reserve max_tokens
     std::filesystem::path context_cost_presets;
-    std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
-    std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
-    std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
-    std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
+    std::uint32_t log_stats_interval_ms  = 5000; // 0 disables periodic Engine throughput logs
+    std::size_t max_request_bytes        = kDefaultMaxRequestBytes;
+    std::uint32_t max_request_json_depth = kDefaultMaxRequestJsonDepth; // --max-request-json-depth
+    std::size_t media_cache_bytes        = kDefaultMediaCacheBytes;
+    std::size_t media_live_bytes         = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
-    int device                             = 0;
-    int tp                                 = 1;
+    // Structured output limits (--constraint-*): input size/depth/items checked in the HTTP layer
+    // and again before compilation, compilation deadline and concurrency, grammar cache, matcher
+    // time budgets of a generating request.
+    OutputConstraintLimits constraint_limits;
+    int device = 0;
+    int tp     = 1;
     std::vector<int> devices; // One id per tensor-parallel rank; {device} at tp 1.
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    // YaRN RoPE extension. factor <= 1 is DISABLED and must stay bit-identical to the
+    // unmodified engine: the fixed-frequency path is bypassed only when factor > 1.
+    float rope_yarn_factor                   = 1.0F;
+    std::uint32_t rope_original_max_position = 262144;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     bool enable_vision = false;
     std::optional<int> vision_device;               // CUDA device of the Vision tower
     std::optional<std::uint32_t> max_vision_tokens; // merged-token ceiling of one media item
-    bool use_cuda_graph     = true;
-    bool tp_mailbox         = true;
-    bool embedding_host     = false; // token embedding table in mapped pinned host memory
+    bool use_cuda_graph = true;
+    bool tp_mailbox     = true;
+    bool embedding_host = false; // token embedding table in mapped pinned host memory
     // Page-locked limit of the host-mapped weights (--host-pinned-max-gib); 0 = none.
     std::uint64_t host_pinned_max_bytes = 0;
-    bool allow_prefix_reuse = true;
-    // --reasoning-close-retry (on by default since v0.7, every model; --no-reasoning-close-retry): a reply that ends with the model's
-    // terminal token inside its thinking (or right after "</think>" with blank content and no tool
-    // call) is closed with "\n</think>\n\n" and continued once (serve/reasoning_retry.h).
+    bool allow_prefix_reuse             = true;
+    // --reasoning-close-retry (on by default since v0.7, every model; --no-reasoning-close-retry):
+    // a reply that ends with the model's terminal token inside its thinking (or right after
+    // "</think>" with blank content and no tool call) is closed with "\n</think>\n\n" and continued
+    // once (serve/reasoning_retry.h).
     bool reasoning_close_retry = true;
-    // --reasoning-eos-guard (on by default since v0.7, every model; --no-reasoning-eos-guard): the first token of a reply that starts in
-    // thinking is never a terminal token; a terminal draw is redrawn without the terminal ids
-    // (models/qwen3_5/execution/reasoning_eos_guard.h). Token-identical when it does not fire.
+    // --reasoning-eos-guard (on by default since v0.7, every model; --no-reasoning-eos-guard): the
+    // first token of a reply that starts in thinking is never a terminal token; a terminal draw is
+    // redrawn without the terminal ids (models/qwen3_5/execution/reasoning_eos_guard.h).
+    // Token-identical when it does not fire.
     bool reasoning_eos_guard = true;
     // Private long-anchor opportunities at the message boundaries before the final message: the
     // last N of them (0 disables). They keep a checkpoint at the point where a cancelled or edited
@@ -82,9 +101,9 @@ struct ServeOptions {
     // measurable, so they keep the anchor.
     std::optional<std::uint32_t> turn_anchors;
     // T64/T66c Qwen4Exp product options (no effect on other models): elastic KV <-> expert slots
-    // (--elastic, --kv-grow, --kv-budget-gib), the decode miss split (--miss-split auto|calibrate|off) and
-    // the prompt-chunk width from which the missing experts stream over PCIe (--stream-min-tokens,
-    // RoutedExpertOptions::stream_min_tokens; 0 = never).
+    // (--elastic, --kv-grow, --kv-budget-gib), the decode miss split (--miss-split
+    // auto|calibrate|off) and the prompt-chunk width from which the missing experts stream over
+    // PCIe (--stream-min-tokens, RoutedExpertOptions::stream_min_tokens; 0 = never).
     ElasticKvOptions elastic_kv;
     // --kv-ram-active (EngineOptions::kv_ram_active): the generating conversation's KV in RAM.
     bool kv_ram_active = false;
