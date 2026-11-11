@@ -266,8 +266,11 @@ class ReqLog:
 
         g = THROUGHPUT.match(msg)
         if g:
+            # an absent half means zero tokens of that class in the window:
+            # record 0.0 (the chart plots it on the y=0 baseline)
             self.throughput = {
-                "decode_tok_s": prate(g["decode"]), "prefill_tok_s": prate(g["prefill"]),
+                "decode_tok_s": prate(g["decode"]) or 0.0,
+                "prefill_tok_s": prate(g["prefill"]) or 0.0,
                 "running": int(g["running"]), "waiting": int(g["waiting"] or 0),
                 "batch": float(g["batch"]) if g["batch"] else None}
             self.throughput_at = t

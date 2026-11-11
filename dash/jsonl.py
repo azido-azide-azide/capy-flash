@@ -139,14 +139,15 @@ class JsonlIngest:
     @staticmethod
     def _throughput_fields(rec: dict) -> dict:
         """Schema-v27 throughput record → ReqLog-shaped rates. Rates arrive
-        pre-computed; a 0.0 rate means no such activity in the window and maps
-        to None (matches the text path, where the absent half stays None)."""
+        pre-computed; a 0.0 rate means no such activity in the window and is
+        kept as 0.0 — the charts plot it on the y=0 baseline so the line stays
+        continuous. Only a missing key (schema drift) stays None."""
         tp = rec.get("throughput_tokens_per_second") or {}
         sched = rec.get("scheduler") or {}
         batch = rec.get("decode_batch") or {}
 
         def rate(v):
-            return round(float(v), 1) if v else None
+            return round(float(v), 1) if isinstance(v, (int, float)) else None
         return {"decode_tok_s": rate(tp.get("decode")),
                 "prefill_tok_s": rate(tp.get("prefill")),
                 "running": int(sched.get("running") or 0),

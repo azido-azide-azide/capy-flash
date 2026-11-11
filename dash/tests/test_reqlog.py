@@ -181,6 +181,13 @@ class TestSyntheticGrammar(unittest.TestCase):
         self.assertEqual(ev[0], "throughput")
         self.assertEqual(ev[1]["waiting"], "2")
 
+    def test_throughput_absent_half_is_zero(self):
+        """The renderer omits a half when that class produced no tokens in the
+        window — record 0.0 (the chart plots it on the y=0 baseline)."""
+        self.feed("throughput | 1.0s | decode 30.0 tok/s (30 tok) | running 1 | batch 1.00 | host 5.0% (5.0 ms)")
+        self.assertAlmostEqual(self.rl.throughput["decode_tok_s"], 30.0)
+        self.assertEqual(self.rl.throughput["prefill_tok_s"], 0.0)
+
     def test_thinking_with_control_clause(self):
         ev = self.feed("req#20 done | anthropic | stop token | prompt 1,000 | output 500 | cache 900 (90.0%) | "
                        "TTFT 120 ms | total 6.0s | prefill 1.2k tok/s | decode 95.0 tok/s | "
