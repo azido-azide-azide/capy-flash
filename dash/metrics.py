@@ -98,19 +98,34 @@ class DashState:
             return round(infl["chunks"] / span, 1) if span > 0.25 else 0.0
         return 0.0
 
+    def _fresh_throughput(self) -> dict | None:
+        """The latest engine `throughput` event (every 5 s — from the text log or
+        the JSONL ledger, both shape .throughput), or None when stale. Engine-
+        reported aggregate rates are the only legitimate live-rate source for a
+        pure observer: per-chunk accounting lives inside the engine, so the
+        chunk-based _live_tok_s is a bonus estimate, never the graph feed."""
+        tp = self.reqlog.throughput
+        if tp and time.time() - self.reqlog.throughput_at < THROUGHPUT_FRESH_S:
+            return tp
+        return None
+
     def _extra(self) -> dict:
-        """telemetry.Telemetry `extra` hook: our live speeds join the 60-sample history."""
-        return {"tok_s": self._live_tok_s(), "prefill_tok_s_mean": None,
-                "slot_tok_s": [self._live_tok_s()]}
+        """telemetry.Telemetry `extra` hook: the engine's 5-second throughput
+        events feed the 60-sample history. Stale rates record None — the charts
+        show an honest gap, never a flat lie."""
+        live = self._live_tok_s()
+        tp = self._fresh_throughput() or {}
+        dec = live or tp.get("decode_tok_s")
+        return {"tok_s": dec, "prefill_tok_s_mean": tp.get("prefill_tok_s"),
+                "slot_tok_s": [dec]}
 
     # -- payload builders -----------------------------------------------------
     def engine_ok(self) -> bool:
         return bool(self.engine_up)
 
     def live(self) -> dict:
-        tp = self.reqlog.throughput
-        fresh = tp and time.time() - self.reqlog.throughput_at < THROUGHPUT_FRESH_S
-        queued = int(tp["waiting"]) if fresh else 0
+        tp = self._fresh_throughput()
+        queued = int(tp["waiting"]) if tp else 0
         infl = self.inflight
         if infl is None:
             state = "idle"
@@ -124,8 +139,8 @@ class DashState:
                 "prompt_tokens": None,
                 "generated": (infl["chunks"] if infl and infl["first"] else None),
                 "elapsed_s": round(time.time() - infl["started"], 1) if infl else None,
-                "tok_s": self._live_tok_s() if state == "generating" else None,
-                "prefill_tok_s_mean": None}
+                "tok_s": (self._live_tok_s() or (tp or {}).get("decode_tok_s")) if state == "generating" else None,
+                "prefill_tok_s_mean": (tp or {}).get("prefill_tok_s")}
 
     def slot_row(self) -> dict:
         """The single /slots row: live in-flight, else the last finished request dimmed."""
