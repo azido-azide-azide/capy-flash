@@ -162,15 +162,24 @@ class TestJsonl(unittest.TestCase):
 
     def test_throughput_and_server_start(self):
         ing = JsonlIngest()
-        kind, fields = ing.event(dict(self._base("throughput"), prefill=10000, decode=2000,
-                                      elapsed_seconds=5.0, running=1, waiting=0,
-                                      decode_ready=1, decode_batch={"average_size": 1.0}))
+        ev = ing.event(dict(self._base("throughput"),
+                                      throughput_tokens_per_second={"decode": 2000.0,
+                                                                   "prefill": 10000.0},
+                                      interval_seconds=5.0,
+                                      scheduler={"running": 1, "waiting": 0,
+                                                 "decode_ready": 1},
+                                      decode_batch={"average_size": 1.0}))
+        assert ev is not None
+        assert ing.throughput is not None
+        kind, fields = ev
         self.assertEqual(kind, "throughput")
-        self.assertEqual(fields, {"run_detail": "decode-ready"})
-        self.assertEqual(ing.throughput["decode_tok_s"], 400.0)
-        self.assertEqual(ing.throughput["prefill_tok_s"], 2000.0)
-        ing.event(dict(self._base("server_start"), model="qwen3.8-27b-quasar",
-                       context_capacity={"tokens": 262144}))
+        self.assertEqual(fields, {"run_detail": "decode-ready 1"})
+        self.assertEqual(ing.throughput["decode_tok_s"], 2000.0)
+        self.assertEqual(ing.throughput["prefill_tok_s"], 10000.0)
+        self.assertEqual(ing.throughput["running"], 1)
+        ing.event(dict(self._base("server_start"),
+                       artifact={"name": "qwen3.8-27b-quasar"},
+                       engine={"kv_capacity": 262144}))
         self.assertEqual(ing.model, "qwen3.8-27b-quasar")
         self.assertEqual(ing.kv_tokens, 262144)
 

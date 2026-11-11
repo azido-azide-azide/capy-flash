@@ -1,20 +1,18 @@
 """JSONL ingestion for capy-dash — the machine-readable twin of reqlog.py.
 
 nInfer's `--request-log-jsonl FILE` appends one `ninfer_serve_request_log`
-JSON object per event (schema-v28 in capy-flash @ 0d15543; field names read
-from src/serve/request_log.cpp). This module exposes the same read surface
-DashState uses from ReqLog (.requests/.last_done/.throughput/.throughput_at/
-.kv_tokens/.model/.engine_state/.n_lines), so server.py can swap it in when
-the flag is on. The live engine does NOT pass the flag — text parsing
-(reqlog.py) is the shipped path; this reader is coded for the day the flag
-is added to the launch line, and its throughput-event mapping is deliberately
-defensive (.get everywhere) until that day verifies the nested names.
+JSON object per event (schema v27 live on the engine since 2026-11-11). The
+nested field names were verified against the real ledger (see
+fixtures/ninfer-requests.sample.jsonl, pulled from CT131): rates arrive
+pre-computed under `throughput_tokens_per_second`, counts under
+`scheduler` / `decode_batch`, capacity under `engine.kv_capacity`. This module
+exposes the same read surface DashState uses from ReqLog
+(.requests/.last_done/.throughput/.throughput_at/.kv_tokens/.model/
+.engine_state/.n_lines), so server.py swaps it in when the flag is on.
 """
 from __future__ import annotations
 
 import time
-
-from reqlog import API_MAP, API_PATH
 
 ARTIFACT = "ninfer_serve_request_log"
 SCHEMA_MIN = 27
@@ -23,6 +21,10 @@ SCHEMA_MIN = 27
 FINISH_MAP = {"stop_token": "stop", "stop_string": "stop", "output_limit": "length",
               "context_capacity": "context capacity", "cancelled": "cancelled",
               "none": "stop", "unknown": "stop"}
+# JSONL protocol names (request.protocol) → (api, path); mirrors reqlog.API_MAP/API_PATH
+PROTO = {"openai_chat_completions": ("openai", "/v1/chat/completions"),
+         "openai_responses": ("openai", "/v1/responses"),
+         "anthropic_messages": ("anthropic", "/v1/messages")}
 
 
 class JsonlIngest:
@@ -66,9 +68,10 @@ class JsonlIngest:
         key = (sess, rid)
 
         if kind == "request_start":
-            self.inflight[key] = {"api": req.get("protocol", ""), "session": sess,
+            api, _ = PROTO.get(req.get("protocol", ""), (req.get("protocol", ""), ""))
+            self.inflight[key] = {"api": api, "session": sess,
                                   "id": rid, "started": ts}
-            return ("started", {"api": req.get("protocol", "")})
+            return ("started", {"api": api})
 
         if kind in ("request_done", "request_error", "request_rejected"):
             self.inflight.pop(key, None)
@@ -83,14 +86,14 @@ class JsonlIngest:
         if kind == "throughput":
             self.throughput = self._throughput_fields(rec)
             self.throughput_at = ts
-            return ("throughput", {"run_detail": "decode-ready"
-                                   if rec.get("decode_ready") else ""})
+            sched = rec.get("scheduler") or {}
+            d, p = sched.get("decode_ready") or 0, sched.get("prefilling") or 0
+            detail = f"decode-ready {d}" if d else (f"prefill {p}" if p else "")
+            return ("throughput", {"run_detail": detail})
 
         if kind == "server_start":
-            self.model = rec.get("model") or self.model
-            cap = rec.get("context_capacity") or rec.get("kv_capacity")
-            if isinstance(cap, dict):
-                cap = cap.get("tokens") or cap.get("context_tokens")
+            self.model = (rec.get("artifact") or {}).get("name") or self.model
+            cap = (rec.get("engine") or {}).get("kv_capacity")
             if isinstance(cap, int):
                 self.kv_tokens = cap
             self.engine_state = "up"
@@ -112,9 +115,11 @@ class JsonlIngest:
             computed = prompt - hit
         prefill_s, decode_s, ttft_s = tim.get("prefill"), tim.get("decode"), tim.get("ttft")
         proto = req.get("protocol", "")
+        api, path = PROTO.get(proto, (proto, proto))
+        queue_s = (rec.get("engine_timing") or {}).get("queue_wait_seconds")
         finish = res.get("finish_reason") or "none"
         return {"id": f"req#{req.get('request_id')}", "session": sess, "time": ts, "slot": 0,
-                "path": API_PATH.get(proto, proto), "api": API_MAP.get(proto, proto),
+                "path": path, "api": api,
                 "output_tokens": out,
                 "decode_tok_s": round(out / decode_s, 1) if out and decode_s else None,
                 "duration_s": round(tim["total"], 2) if tim.get("total") else None,
@@ -122,7 +127,7 @@ class JsonlIngest:
                 "prompt_tokens": prompt, "reused": hit,
                 "prompt_ms": round(prefill_s * 1000, 1) if prefill_s else None,
                 "ttft_s": round(ttft_s, 3) if ttft_s else None,
-                "queue_s": None,                     # JSONL carries prepare (not queue); stay honest
+                "queue_s": round(queue_s, 3) if queue_s else None,
                 "cache_pct": round(hit / prompt * 100, 1) if prompt else None,
                 "cache_path": res.get("prefix_reuse_path"),
                 "spec_backend": spec.get("backend"),
@@ -133,14 +138,17 @@ class JsonlIngest:
 
     @staticmethod
     def _throughput_fields(rec: dict) -> dict:
-        """Counters + elapsed_seconds → the ReqLog-shaped rates (best-effort until
-        the flag goes live; unknown nested names stay None, never guessed)."""
-        el = rec.get("elapsed_seconds")
-        pre = rec.get("prefill")
-        dec = rec.get("decode")
+        """Schema-v27 throughput record → ReqLog-shaped rates. Rates arrive
+        pre-computed; a 0.0 rate means no such activity in the window and maps
+        to None (matches the text path, where the absent half stays None)."""
+        tp = rec.get("throughput_tokens_per_second") or {}
+        sched = rec.get("scheduler") or {}
         batch = rec.get("decode_batch") or {}
-        return {"decode_tok_s": round(dec / el, 1) if dec and el else None,
-                "prefill_tok_s": round(pre / el, 1) if pre and el else None,
-                "running": int(rec.get("running") or 0),
-                "waiting": int(rec.get("waiting") or 0),
+
+        def rate(v):
+            return round(float(v), 1) if v else None
+        return {"decode_tok_s": rate(tp.get("decode")),
+                "prefill_tok_s": rate(tp.get("prefill")),
+                "running": int(sched.get("running") or 0),
+                "waiting": int(sched.get("waiting") or 0),
                 "batch": batch.get("average_size") if isinstance(batch, dict) else None}

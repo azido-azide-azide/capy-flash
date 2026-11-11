@@ -148,8 +148,8 @@ def main():
     ap.add_argument("--log", default="/var/log/ninfer-serve.log")
     ap.add_argument("--request-log-jsonl", default="",
                     help="tail this JSONL (ninfer_serve_request_log) for exact per-request "
-                         "numbers INSTEAD of parsing --log; requires the engine flag "
-                         "--request-log-jsonl — off on the live engine, keep this off to match")
+                         "numbers INSTEAD of parsing --log; the live engine (CT131) passes "
+                         "--request-log-jsonl and the deployed unit does the same")
     ap.add_argument("--api-key", default="", help="guards the dash endpoints only; /v1 auth stays at the engine")
     ap.add_argument("--gpu", action="append", type=int, default=None)
     args = ap.parse_args()

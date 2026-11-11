@@ -112,8 +112,8 @@ def tail_jsonl(state, path: str, ingest, poll_s: float = 1.0,
                drive_inflight: bool = True) -> None:
     """Follow the engine's --request-log-jsonl file (schema
     `ninfer_serve_request_log`); each JSON line goes to `ingest.event(rec)`.
-    Coded-but-off by default: enabling it means adding the launch flag to the
-    engine, which is a separate decision (see dash/README.md)."""
+    Live on CT131 since 2026-11-11 (engine launch flag + unit drop-in) — see
+    dash/README.md, *JSONL mode*."""
     def on_line(text: str):
         text = text.strip()
         if not text:
