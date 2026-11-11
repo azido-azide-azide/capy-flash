@@ -27,11 +27,13 @@ Stdlib only (Python ≥ 3.10; `psutil` is used opportunistically by
 dash endpoints only. `--request-log-jsonl FILE` switches the per-request
 ingestion from log parsing to the engine's structured
 `ninfer_serve_request_log` (see *JSONL mode* below) — it requires the matching
-engine launch flag and is **off by default**, matching the live launch line.
+engine launch flag, which is **live on CT131** (`llm-flip.sh` passes
+`--request-log-jsonl /var/log/ninfer-requests.jsonl`, 2026-11-11); the
+deployed unit's drop-in passes it to the dash.
 
 Tests: `python3 dash/tests/test_reqlog.py`, `test_logbuf.py`,
-`test_metrics.py`, `test_follow.py` (plain stdlib `unittest`). They replay the
-real log excerpts under `dash/fixtures/`.
+`test_metrics.py`, `test_follow.py`, `test_jsonl.py` (plain stdlib `unittest`).
+They replay the real log excerpts under `dash/fixtures/`.
 
 ## Provenance
 
@@ -98,11 +100,14 @@ History semantics: request history and log ring live inside the sidecar and
 survive engine restarts (the log is append-mode across sessions); a sidecar
 restart re-seeds from the last 500 log lines.
 
-## JSONL mode (coded, OFF)
+## JSONL mode (LIVE on CT131)
 
 `ninfer-serve --request-log-jsonl FILE` emits `ninfer_serve_request_log`
-schema-v28 JSONL (`src/serve/request_log.cpp`) with exact per-request
-numbers. `jsonl.py` + `--request-log-jsonl` consume it and replace the regex
-parser for history state. Enabling it end-to-end means adding the launch flag
-to the engine start path — an engine restart decision that is explicitly out
-of scope here; keep the flag off to match the live launch.
+schema-v27 JSONL with exact per-request numbers. `jsonl.py` +
+`--request-log-jsonl` consume it and replace the regex parser for history
+state. The flag went live in `llm-flip.sh` on 2026-11-11 (one engine restart
+window, user-approved); the deployed `capy-dash` unit carries a drop-in
+(`/etc/systemd/system/capy-dash.service.d/jsonl.conf`) that passes the ledger
+path. `jsonl.py`'s field mapping is verified against the real ledger —
+`fixtures/ninfer-requests.sample.jsonl` is a verbatim pull of one line per
+event kind from CT131, and `tests/test_jsonl.py` replays it.
