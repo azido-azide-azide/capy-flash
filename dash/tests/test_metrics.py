@@ -160,6 +160,17 @@ class TestThroughputGraphFeed(unittest.TestCase):
         self.assertIsNone(ex["prefill_tok_s_mean"])
         self.assertEqual(ex["slot_tok_s"], [None])
 
+    def test_zero_rates_record_zeros_not_gaps(self):
+        """Fresh window, engine idle: 0.0 rates record 0.0 — the charts plot
+        them on the y=0 baseline (continuous line), not as missing segments."""
+        self.st.reqlog.throughput = {"decode_tok_s": 0.0, "prefill_tok_s": 0.0,
+                                     "running": 0, "waiting": 0, "batch": None}
+        self.st.reqlog.throughput_at = time.time() - 1.0
+        ex = self.st._extra()
+        self.assertEqual(ex["tok_s"], 0.0)
+        self.assertEqual(ex["prefill_tok_s_mean"], 0.0)
+        self.assertEqual(ex["slot_tok_s"], [0.0])
+
     def test_live_block_uses_fresh_throughput(self):
         self._set_tp(1.0, waiting=2)
         lv = self.st.live()
