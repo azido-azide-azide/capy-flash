@@ -72,6 +72,9 @@ function sbChart(a, lo, hi, accent, limit) {
 }
 const gy = t => t ? 100 - t * 92 - 4 : 4;             // gridline height for a fraction of the axis
 const grid = fr => fr.map(t => `<line x1="0" x2="100" y1="${gy(t)}" y2="${gy(t)}" stroke="var(--line-soft)" vector-effect="non-scaling-stroke"/>`).join("");
+// the y=0 axis: the Speed charts map 0 → 96 (4 top pad, 92 span), so the base
+// line sits one grid step below the .75 line — same --line style as the sparklines' baseLine
+const speedBase = `<line x1="0" x2="100" y1="96" y2="96" stroke="var(--line)" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
 // small tick labels at the right edge, at the top and middle gridlines, skipped where an end label sits
 const ticks = (max, labels) => [[4, max], [50, max / 2]].filter(t => !labels.some(l => Math.abs(l - t[0]) < 12))
   .map(t => `<span class="tk" style="top:${t[0]}%">${tick(t[1])}</span>`).join("");
@@ -156,7 +159,7 @@ function drawHero(live, hist, reqs, best, slots) {
   const peak = a => Math.max(0, ...a.filter(num));
   const max = nice(Math.max(peak(agg), 40));
   const y = v => 100 - 4 - Math.min(v, max) / max * 92;
-  let svg = grid([0, .25, .5, .75]);
+  let svg = grid([0, .25, .5, .75]) + speedBase;
   const labels = [];
   lines(agg, y).forEach(p => { svg += poly(p, `stroke="${SC0}" stroke-width="1.7"`); });
   let lab = "";
@@ -173,7 +176,7 @@ function drawHero(live, hist, reqs, best, slots) {
   html($("#pre-v"), num(pre) ? `${fmt(pre)}<small>tok/s</small>` : "-");
   const pa = tail(hist.prefill_tok_s_mean).map(v => v > 0 ? v : v === 0 ? 0 : null);
   const pmax = nice(Math.max(1000, ...pa.filter(num)));
-  html($("#pre-chart"), `<svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Prefill tokens per second, last 60 seconds">${grid([0, .5])}`
+  html($("#pre-chart"), `<svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Prefill tokens per second, last 60 seconds">${grid([0, .5])}${speedBase}`
     + lines(pa, v => 100 - 4 - Math.min(v, pmax) / pmax * 92).map(p => poly(p, `stroke="var(--fg)" stroke-width="1.6"`)).join("") + `</svg>${ticks(pmax, [])}`);
   html($("#pre-last"), r && num(r.prompt_tokens) ? `<b>${fmt(r.prompt_tokens)}</b> tok${num(r.prompt_ms) ? ` in <b>${(r.prompt_ms / 1000).toFixed(2)}</b> s` : ""}` : "-");
   text($("#pre-hit"), r && r.prompt_tokens > 0 && num(r.reused) ? `${Math.round(r.reused / r.prompt_tokens * 100)}%` : "-");
