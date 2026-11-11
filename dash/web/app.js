@@ -58,6 +58,15 @@ function lines(a, y, W = 100) {
   return out.map(c => c.length === 1 ? [c[0], c[0].replace(/^[\d.]+/, x => String(+x + .01))] : c);
 }
 const poly = (pts, attrs) => `<polyline points="${pts.join(" ")}" fill="none" vector-effect="non-scaling-stroke" stroke-linejoin="round" ${attrs}/>`;
+// trailing gap (stream ended, no fresh data): plot the remaining samples on
+// the y=0 baseline so the line reaches y=0 and runs to the right edge
+// instead of ending mid-chart
+const tailZero = a => {
+  let last = a.length - 1;
+  while (last >= 0 && a[last] == null) last--;
+  if (last < 0 || last === a.length - 1) return a;
+  return a.map((v, i) => i > last ? 0 : v);
+};
 const area = (pts, fill) => `<polygon points="${pts[0].split(",")[0]},100 ${pts.join(" ")} ${pts[pts.length - 1].split(",")[0]},100" fill="${fill}"/>`;
 const baseLine = `<line x1="0" y1="100" x2="100" y2="100" stroke="var(--line)" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
 let gid = 0;
@@ -155,17 +164,13 @@ function drawHero(live, hist, reqs, best, slots) {
   $("#dec-v").classList.toggle("idle", !liveDec);
 
   // single stream: one aggregate series, no per-slot chips (upstream 161-181, 221-225)
-  const agg = tail(hist.tok_s);
+  const agg = tailZero(tail(hist.tok_s));
   const peak = a => Math.max(0, ...a.filter(num));
   const max = nice(Math.max(peak(agg), 40));
   const y = v => 100 - 4 - Math.min(v, max) / max * 92;
   let svg = grid([0, .25, .5, .75]) + speedBase;
-  const labels = [];
   lines(agg, y).forEach(p => { svg += poly(p, `stroke="${SC0}" stroke-width="1.7"`); });
-  let lab = "";
-  const end = a => { const s = stats(a); return s ? y(s.last) : null; };
-  if (end(agg) != null) { labels.push(end(agg)); lab += `<span class="cl" style="top:${end(agg).toFixed(1)}%;color:${SC0}">req</span>`; }
-  html($("#dec-chart"), `<svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Decode tokens per second, last 60 seconds">${svg}</svg>${lab}${ticks(max, labels)}`);
+  html($("#dec-chart"), `<svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Decode tokens per second, last 60 seconds">${svg}</svg>${ticks(max, [])}`);
 
   // the live read rate while reading, else the newest finished request's that read part of its prompt
   const readOf = x => (x.prompt_tokens || 0) - (x.reused || 0);
@@ -174,7 +179,7 @@ function drawHero(live, hist, reqs, best, slots) {
   const pre = livePre ? live.prefill_tok_s_mean : lastPre;
   text($("#pre-k"), livePre ? "Prefill" : lastPre != null ? "Prefill · Last request" : "Prefill");
   html($("#pre-v"), num(pre) ? `${fmt(pre)}<small>tok/s</small>` : "-");
-  const pa = tail(hist.prefill_tok_s_mean).map(v => v > 0 ? v : v === 0 ? 0 : null);
+  const pa = tailZero(tail(hist.prefill_tok_s_mean).map(v => v > 0 ? v : v === 0 ? 0 : null));
   const pmax = nice(Math.max(1000, ...pa.filter(num)));
   html($("#pre-chart"), `<svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Prefill tokens per second, last 60 seconds">${grid([0, .5])}${speedBase}`
     + lines(pa, v => 100 - 4 - Math.min(v, pmax) / pmax * 92).map(p => poly(p, `stroke="var(--fg)" stroke-width="1.6"`)).join("") + `</svg>${ticks(pmax, [])}`);
