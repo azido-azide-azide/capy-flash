@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from follow import poll_engine, tail_jsonl, tail_log
-from jsonl import JsonlIngest
+from jsonl import ARTIFACT, JsonlIngest
 from metrics import DashState
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -125,6 +125,55 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _lines_backwards(path: str, chunk: int = 1 << 20):
+    """Complete lines from the end of a file, newest first, in `chunk`-byte
+    windows. A line straddling a window boundary is carried one round and
+    emitted exactly once (lines are far smaller than the window, so a line
+    can straddle at most one boundary); a partial line at the very end of the
+    file (in-flight write) is emitted best-effort — callers skip JSON that
+    does not parse."""
+    carry = b""
+    with open(path, "rb") as f:
+        size = f.seek(0, 2)
+        pos = size
+        while pos > 0:
+            n = min(chunk, pos)
+            start = pos - n
+            pos = start
+            f.seek(start)
+            *lines, rem = f.read(n).split(b"\n")
+            if carry:
+                yield rem + carry                 # the line straddling `pos`, complete
+                carry = b""
+            elif rem:
+                yield rem                         # complete line at the window's end
+            if start > 0 and lines:
+                f.seek(start - 1)
+                if f.read(1) != b"\n":            # first line's head is in the earlier window
+                    carry = lines.pop(0)
+            for line in reversed(lines):
+                if line:
+                    yield line
+    if carry:                                    # file started mid-line: best-effort
+        yield carry
+
+
+def latest_server_start(path: str, chunk: int = 1 << 20) -> dict | None:
+    """The most recent `server_start` record in a JSONL ledger (model name +
+    KV capacity). Scans backwards from the end and stops at the first hit, so
+    the cost is the distance to that record — one engine session's worth of
+    lines — not the file size. None when the ledger holds none."""
+    for raw in _lines_backwards(path, chunk):
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("artifact_type") == ARTIFACT \
+                and rec.get("event") == "server_start":
+            return rec
+    return None
+
+
 def seed(state: DashState, log_path: str, tail: int = 500) -> int:
     """Load the newest `tail` log lines into the ring (log panel) and the parser
     (history) so the dashboard opens with context. Returns the line count seeded."""
@@ -163,6 +212,12 @@ def main():
         ingest = JsonlIngest()
         STATE.reqlog = ingest
         if os.path.exists(args.request_log_jsonl):
+            # The current session's `server_start` (model + KV capacity) sits
+            # beyond the 500-line seed window once a session outlives it:
+            # back-scan for it so /metrics context isn't null at startup.
+            ss = latest_server_start(args.request_log_jsonl)
+            if ss is not None:
+                ingest.event(ss)
             with open(args.request_log_jsonl, "rb") as f:
                 for raw in f.read()[-262144:].decode("utf-8", "replace").splitlines()[-500:]:
                     try:
