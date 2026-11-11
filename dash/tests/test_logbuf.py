@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import unittest
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -69,10 +70,13 @@ class TestLogRing(unittest.TestCase):
         ring.add_line(env("INFO", "hello"))
         lines, _ = ring.buffer.since(0)
         t = lines[0]["t"]
-        # 2026-11-09 12:34:56.789 local → within a day of now (tz-dependent parse),
-        # and definitely not the wall-clock `before` time:
-        self.assertLess(abs(t - before), 86400 * 2)
-        self.assertNotAlmostEqual(t, before, places=2)
+        # The entry must carry the ENVELOPE stamp (2026-11-09 12:34:56.789), not
+        # the wall clock. Compare against that wall time read as UTC: any real
+        # tz parse lands within ±15 h of it, and the fixture date recedes from
+        # "now" forever, so this never rots (a fixed window from `before` did).
+        utc_ts = datetime(2026, 11, 9, 12, 34, 56, 789000, tzinfo=timezone.utc).timestamp()
+        self.assertLess(abs(t - utc_ts), 15 * 3600)
+        self.assertGreater(abs(t - before), 24 * 3600)
 
     def test_blank_lines_dropped_and_src_tagged(self):
         ring = LogRing(LogBuffer(level_reader_factory=NinferLevelReader))
