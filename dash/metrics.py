@@ -110,9 +110,10 @@ class DashState:
         return None
 
     def _extra(self) -> dict:
-        """telemetry.Telemetry `extra` hook: the engine's 5-second throughput
-        events feed the 60-sample history. Stale rates record None — the charts
-        show an honest gap, never a flat lie."""
+        """telemetry.Telemetry `extra` hook: the engine's throughput events
+        feed the 60-sample history. A zero rate records 0.0 — the charts plot
+        it on the y=0 baseline, line continuous; a stale (no fresh event)
+        window records None, an honest gap, never a flat lie."""
         live = self._live_tok_s()
         tp = self._fresh_throughput() or {}
         dec = live or tp.get("decode_tok_s")
