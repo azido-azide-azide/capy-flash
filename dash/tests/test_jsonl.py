@@ -44,14 +44,23 @@ class TestThroughputMapping(unittest.TestCase):
         self.assertEqual(tp["batch"], rec["decode_batch"]["average_size"])
         self.assertAlmostEqual(ing.throughput_at, rec["timestamp_unix_ms"] / 1000.0)
 
-    def test_zero_prefill_maps_to_none(self):
+    def test_zero_prefill_maps_to_zero(self):
+        """A 0.0 rate is kept as 0.0 (the chart plots it on the y=0 baseline,
+        keeping the line continuous) — not dropped to a gap."""
         ing = JsonlIngest()
         rec = next(r for r in sample()
                    if r["event"] == "throughput" and r["throughput_tokens_per_second"]["prefill"] == 0
                    and r["throughput_tokens_per_second"]["decode"] > 0)
         feed(ing, rec)
-        self.assertEqual(ing.throughput["prefill_tok_s"], None)
+        self.assertEqual(ing.throughput["prefill_tok_s"], 0.0)
         self.assertIsNotNone(ing.throughput["decode_tok_s"])
+
+    def test_missing_rate_key_stays_none(self):
+        ing = JsonlIngest()
+        rec = next(r for r in sample() if r["event"] == "throughput")
+        del rec["throughput_tokens_per_second"]["prefill"]
+        feed(ing, rec)
+        self.assertIsNone(ing.throughput["prefill_tok_s"])
 
     def test_run_detail_from_scheduler(self):
         ing = JsonlIngest()
