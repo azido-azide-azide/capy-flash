@@ -5,6 +5,7 @@ one must be a deliberate edit to both README and this file.
 Run: python3 tests/test_metrics.py"""
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -128,6 +129,48 @@ class TestBestAndP85(unittest.TestCase):
         best, _ = best_and_p85(list(reversed(reqs)))
         self.assertEqual(best["decode"]["id"], "req#2")
         self.assertEqual(best["decode"]["tok_s"], 44.2)
+
+
+class TestThroughputGraphFeed(unittest.TestCase):
+    """The decode/prefill charts are fed by the engine's 5-second `throughput`
+    events (both text-log ReqLog and JsonlIngest shape .throughput). A pure
+    observer never sees per-chunk rates, and stale rates must record None so
+    the charts show a gap — never a flat zero pretending to be an idle engine.
+    Run: python3 tests/test_metrics.py"""
+
+    def setUp(self):
+        self.st = make_state()
+
+    def _set_tp(self, age_s, waiting=0):
+        self.st.reqlog.throughput = {"decode_tok_s": 97.3, "prefill_tok_s": 812.5,
+                                     "running": 1, "waiting": waiting, "batch": 1.0}
+        self.st.reqlog.throughput_at = time.time() - age_s
+
+    def test_fresh_throughput_feeds_both_series(self):
+        self._set_tp(2.0)
+        ex = self.st._extra()
+        self.assertEqual(ex["tok_s"], 97.3)
+        self.assertEqual(ex["prefill_tok_s_mean"], 812.5)
+        self.assertEqual(ex["slot_tok_s"], [97.3])
+
+    def test_stale_throughput_records_gaps_not_zeros(self):
+        self._set_tp(60.0)
+        ex = self.st._extra()
+        self.assertIsNone(ex["tok_s"])
+        self.assertIsNone(ex["prefill_tok_s_mean"])
+        self.assertEqual(ex["slot_tok_s"], [None])
+
+    def test_live_block_uses_fresh_throughput(self):
+        self._set_tp(1.0, waiting=2)
+        lv = self.st.live()
+        self.assertEqual(lv["prefill_tok_s_mean"], 812.5)
+        self.assertEqual(lv["queued"], 2)
+
+    def test_live_block_gaps_when_stale(self):
+        self._set_tp(60.0, waiting=2)
+        lv = self.st.live()
+        self.assertIsNone(lv["prefill_tok_s_mean"])
+        self.assertEqual(lv["queued"], 0)
 
 
 if __name__ == "__main__":
