@@ -21,10 +21,11 @@ Upstream, plus the one addition this deployment runs on top of it:
   [dash/README.md](dash/README.md)); the ninfer operational-log parser, the follower threads, the JSONL reader
   and the route server are new. `dash/tests/` replays committed serve-log and ledger fixtures.
 
-Nothing else is changed: apart from this notice, the diff to upstream touches `dash/` and no other path.
+Nothing else is changed: apart from this notice and a `!dash/fixtures/*.log` negation in `.gitignore`, the
+diff to upstream touches `dash/` and no other path.
 
-Synced to upstream main at `a9e35b7` (v0.11.1, 2026-11-13); on top of it sit the eight `dash:` commits and this
-notice. The upstream documentation, benchmarks and claims below are upstream's.
+Synced to upstream main at `753cb06` (v0.12.0, 2026-11-14); on top of it sit the `dash:` commits - this fork's
+only code addition - and this notice. The upstream documentation, benchmarks and claims below are upstream's.
 
 **Qwen3.8-Flash-Next (125B MoE) and Qwen3.8-27B on one or two 16 GB RTX 50-series GPUs, built for agents.**
 
