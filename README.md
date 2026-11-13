@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.10.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.11.1**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -183,6 +183,23 @@ How the engine runs these models, every server flag, the RAM tiers, the chat tem
 [docs/serving.md](docs/serving.md#capy-flash-serving). Environment variables and diagnostics:
 [docs/capy-flash/diagnostics.md](docs/capy-flash/diagnostics.md). All documentation: [docs/README.md](docs/README.md).
 
+### Optional speed switches (off by default)
+
+Two environment variables make Flash-Next prefill faster at the price of a small change in the numbers. Both are
+**off by default**. Set them in the server's environment, e.g. `NINFER_TP_AR_PAYLOAD=int8 ninfer-serve ...`. A third
+one, lossless, is on by default since v0.11.1 on pairs without P2P (`NINFER_TP_XIN_KERNEL=0` turns it off).
+
+| Variable | Applies to | What it changes | Prefill gain on Flash-Next (2x RTX 5070 Ti, fresh 30k-100k prompts) | Loss, our measurements |
+|---|---|---|---|---|
+| `NINFER_TP_XIN_KERNEL` (on by default without P2P since v0.11.1) | tp 2 without P2P | nothing in the numbers: the exchange between the GPUs is received by a kernel instead of queueing on the copy engine | 0 to +3 % on our setup; +6-7 % with `--kv-ram-active` | none, same tokens |
+| `NINFER_TP_AR_PAYLOAD=int8` | Flash-Next (no effect on the 27B) | the prefill exchange between the GPUs carries int8 codes with an FP16 scale per 32 rows instead of FP16 | +7-8 % | perplexity −0.22 % (NVFP4), −0.26 % (GSQ-RCO): within noise |
+| `NINFER_Q8_A8=128` (or `32`) | Flash-Next | the dense Q8 projections of the prefill run with int8 activations on the int8 tensor cores | +7-8 % | perplexity +0.21 % (NVFP4), +0.004 % (GSQ-RCO): within noise |
+
+The two lossy switches change individual tokens, so they stay opt-in, but in our tests the loss is negligible. All
+three together on Flash-Next NVFP4: prefill +28-29 % over the default; GSM8K (1,319 questions) 0.9788, against 0.9811
+for vLLM on a GB300 (McNemar p 0.38); MMLU-Pro (504 questions) 0.8472, against 0.8492 for the default under the same
+conditions (paired, p 1.0). Details in [docs/capy-flash/diagnostics.md](docs/capy-flash/diagnostics.md).
+
 ## Benchmarks
 
 Our machine: AMD Ryzen 9 9900X (12 cores), 96 GB DDR5-5600, 2x RTX 5070 Ti 16 GB on PCIe 5.0 x8 + x8 (no P2P),
@@ -305,6 +322,20 @@ artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.11.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.11.1))
+- The lossless receive of the tp-2 exchange by kernel ([PR #66](https://github.com/ValerioDolci/capy-flash/pull/66)) is on
+  by default on pairs without P2P; `NINFER_TP_XIN_KERNEL=0` restores the copy engine. Same tokens as v0.11.0.
+
+**v0.11.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.11.0))
+- Faster prefill, same bits at the default: Flash-Next +13 % at 30k-100k (QSA attention at two CTAs per SM, fused
+  hyper-connection Up, wider GDN tiles), 27B +2-5 % prefill and −1 % per decode round. Eleven PRs by @Mici81.
+- Opt-in: `NINFER_TP_XIN_KERNEL=1` (same bits, tp-2 exchange without P2P off the copy engine),
+  `NINFER_TP_AR_PAYLOAD=int8` and `NINFER_Q8_A8=128` (Flash-Next, change numerics): all three together +28 % on
+  Flash-Next prefill, GSM8K and MMLU-Pro at the level of v0.10.0. See
+  [Optional speed switches](#optional-speed-switches-off-by-default).
+- Fixed: tool-call arguments that quote the tool-call markup no longer fall back to text
+  ([#59](https://github.com/ValerioDolci/capy-flash/issues/59)).
 
 **v0.10.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.10.0))
 - Structured output ([#17](https://github.com/ValerioDolci/capy-flash/issues/17)): JSON mode, JSON Schema, GBNF
