@@ -24,7 +24,7 @@ Upstream, plus the one addition this deployment runs on top of it:
 Nothing else is changed: apart from this notice and a `!dash/fixtures/*.log` negation in `.gitignore`, the
 diff to upstream touches `dash/` and no other path.
 
-Synced to upstream main at `ac719a1` (v0.13.1, 2026-11-15); on top of it sit the `dash:` commits - this fork's
+Synced to upstream main at `a0c312e` (v0.13.3, 2026-11-17); on top of it sit the `dash:` commits - this fork's
 only code addition - and this notice. The upstream documentation, benchmarks and claims below are upstream's.
 
 **Qwen3.8-Flash-Next (125B MoE) and Qwen3.8-27B on one or two 16 GB RTX 50-series GPUs, built for agents.**
