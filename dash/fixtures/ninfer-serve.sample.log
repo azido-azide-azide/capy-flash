@@ -1,0 +1,14 @@
+2026-11-09 13:03:44.211  INFO  listening on http://0.0.0.0:8000 | model qwen3.8-27b-quasar | auth disabled
+2026-11-09 13:03:44.112  INFO  tensor parallel | tp 2 on devices 0,1 | p2p on | KV, StateImages and runtime reserved per rank | 4 Device checkpoint StateImages | Host cache backed on both ranks: 8 Host StateImages, 8192 MiB Host KV
+2026-11-09 13:03:44.112  INFO  capacity | KV 262,144 tokens, int8, auto | pages 4,096/4,096 | runtime 4.97 GiB | free 2.21 GiB
+2026-11-09 13:03:44.112  INFO  context cache | 1 active + 4 cached device states | host 8 states, 8.00 GiB KV | private 8 | shared 4 | anchors 2 | turn anchors 1
+2026-11-09 10:15:07.269  INFO  req#7 started | openai-chat stream | 28 messages | max output 32,768 | thinking xhigh, budget 32,768 | tools 19
+2026-11-09 10:15:07.054  INFO  req#3 done | openai-chat | tool calls 1 | prompt 80,589 | output 14,449 | cache 0 (0.0%) | TTFT 48.5s | total 4m 2.9s | queue 16.9s | prefill 2.55k tok/s | decode 74.4 tok/s | dflash2 accepted 8,474/29,880 (28.4%) | thinking 10,469/32,768
+2026-11-09 10:15:29.480  INFO  req#7 done | openai-chat | tool calls 1 | prompt 95,151 | output 1,352 | cache 80,584 (84.7%, turn closure) | TTFT 9.4s | total 22.3s | queue 27.0 ms | prefill 1.57k tok/s | decode 104.7 tok/s | dflash2 accepted 960/1,960 (49.0%) | thinking 987/32,768
+2026-11-09 13:06:33.550  INFO  req#8 cancelled during transport | openai-chat | HTTP 499 | client disconnected
+2026-11-09 10:20:27.767  WARN  req#24 failed during generation | openai-chat | HTTP 503 | request queue timeout
+2026-11-09 10:13:55.598  INFO  throughput | 5.0s | decode 30.6 tok/s (153 tok) | running 1 (decode-ready 1) | batch 1.00 | host 4.9% (247 ms)
+2026-11-09 10:14:00.598  INFO  throughput | 5.0s | decode 30.8 tok/s (154 tok) | running 1 (decode-ready 1) | batch 1.00 | host 4.7% (234 ms)
+2026-11-09 10:18:22.365  INFO  req#17 done | openai-chat | tool calls 1 | prompt 48,092 | output 2,756 | cache 47,138 (98.0%, private endpoint) | TTFT 515 ms | total 26.4s | queue 11.9 ms | prefill 2.06k tok/s | decode 106.6 tok/s | dflash2 accepted 1,916/4,205 (45.6%) | thinking 2,487/32,768
+2026-11-09 10:27:06.498  FATAL server failed during startup | invalid CUDA device id
+2026-11-09 13:11:51.380  INFO  server stopped

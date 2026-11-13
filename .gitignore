@@ -43,6 +43,9 @@ out/
 /AGENTS.override.md
 /logs/
 *.log
+# dash's committed log fixtures ARE tracked (they replay the serve log in the tests);
+# the blanket *.log above silently swallowed them.
+!dash/fixtures/*.log
 *.tmp
 /core
 /core.*
