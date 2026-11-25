@@ -74,9 +74,31 @@ class JsonlIngest:
             return ("started", {"api": api})
 
         if kind in ("request_done", "request_error", "request_rejected"):
-            self.inflight.pop(key, None)
+            start_info = self.inflight.pop(key, None)
             if kind != "request_done":
-                return ("failed", {"id": rid})
+                # LEON FEATURE 11-25: errors/rejections get a requests-table row too,
+                # carrying the ledger's exact `error.message` for the click-to-see UI.
+                # The engine ledger has no per-error http code here; the message is
+                # the engine's own truth (`client disconnected`, `request queue
+                # timeout`, CUDA errors, ...). finish: cancelled for a client-side
+                # cancel, error otherwise.
+                err_msg = str((rec.get("error") or {}).get("message") or kind)
+                proto = req.get("protocol", "")
+                api, path = PROTO.get(proto, (proto, proto))
+                start_ts = (start_info or {}).get("started")
+                row = {"id": f"req#{rid}", "session": sess, "time": ts, "slot": 0,
+                       "path": path, "api": api,
+                       "output_tokens": None, "decode_tok_s": None,
+                       "duration_s": round(ts - start_ts, 2) if start_ts else None,
+                       "finish": "cancelled" if "disconnected" in err_msg or "cancelled" in err_msg else "error",
+                       "prompt_tokens": None, "reused": None, "prompt_ms": None,
+                       "ttft_s": None, "queue_s": None, "cache_pct": None, "cache_path": None,
+                       "spec_backend": None, "drafts_accepted": None, "drafts_offered": None,
+                       "thinking_tokens": None, "thinking_budget": None,
+                       "error_msg": err_msg}
+                self.requests.insert(0, row)
+                del self.requests[self.MAX_KEEP:]
+                return ("failed", {"id": rid, "api": row["api"], "error_msg": err_msg})
             done = self._done_fields(req, rec, ts, sess)
             self.requests.insert(0, done)
             del self.requests[self.MAX_KEEP:]
@@ -134,7 +156,8 @@ class JsonlIngest:
                 "drafts_accepted": spec.get("accepted_tokens"),
                 "drafts_offered": spec.get("drafted_tokens"),
                 "thinking_tokens": res.get("model_thinking_tokens"),
-                "thinking_budget": res.get("thinking_budget")}
+                "thinking_budget": res.get("thinking_budget"),
+                "error_msg": None}
 
     @staticmethod
     def _throughput_fields(rec: dict) -> dict:

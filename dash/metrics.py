@@ -27,6 +27,10 @@ BEST_MIN_READ = 4096         # newly read prompt tokens, for the best/p85 prefil
 THROUGHPUT_FRESH_S = 15.0    # engine prints a `throughput` line every 5 s; older = stale
 
 
+def num_(v):
+    return isinstance(v, (int, float)) and v == v and v not in (float("inf"), float("-inf"))
+
+
 def best_and_p85(requests: list[dict]) -> tuple[dict, dict]:
     """Ported from serve/service.py metrics(): `best` scan + the p85 nearest-rank over the
     same minimum-size gates, so a wild short-request rate can never stand beside best."""
@@ -120,6 +124,20 @@ class DashState:
         return {"tok_s": dec, "prefill_tok_s_mean": tp.get("prefill_tok_s"),
                 "slot_tok_s": [dec]}
 
+    def rates(self) -> dict:
+        """Per-request rates over EVERY kept request (up to MAX_KEEP since the
+        engine process started — not the 60 s window, not the p85 gates), so the
+        click-a-big-number histograms can show the full distribution. decode:
+        tok/s per finished generation; prefill: newly-read prompt tokens /
+        measured prefill seconds (excludes cache hits, same math as best/p85)."""
+        dec = [r["decode_tok_s"] for r in self.reqlog.requests if num_(r.get("decode_tok_s"))]
+        pre = []
+        for r in self.reqlog.requests:
+            read = (r.get("prompt_tokens") or 0) - (r.get("reused") or 0)
+            if read > 0 and num_(r.get("prompt_ms")) and r["prompt_ms"] > 0:
+                pre.append(round(read / (r["prompt_ms"] / 1000), 1))
+        return {"decode": sorted(dec), "prefill": sorted(pre)}
+
     # -- payload builders -----------------------------------------------------
     def engine_ok(self) -> bool:
         return bool(self.engine_up)
@@ -175,6 +193,6 @@ class DashState:
         engine = {"model": self.reqlog.model or self.model_hint, "context": kv, "max_context": kv}
         return {"engine": engine, "live": self.live(),
                 "requests": self.reqlog.requests[:REQUESTS_SHOWN],
-                "best": best, "p85": p85,
+                "best": best, "p85": p85, "rates": self.rates(),
                 "hardware": tel["now"], "hardware_static": tel["static"],
                 "history": tel["history"]}
