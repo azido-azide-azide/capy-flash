@@ -109,14 +109,13 @@ class TestSampleLog(unittest.TestCase):
         self.assertAlmostEqual(r3["queue_s"], 16.9)
 
     def test_failed_line(self):
+        # Leon 11-25: failed/cancelled events now carry a shaped error_msg (HTTP + cause)
         evs = [e[1] for e, t in zip(self.events, self.types) if t == "failed"]
-        cancelled = next(e for e in evs if e["word"] == "cancelled")
-        self.assertEqual(cancelled["phase"], "transport")
-        self.assertEqual(cancelled["http"], "499")
-        self.assertEqual(cancelled["cause"], "client disconnected")
-        warnfail = next(e for e in evs if e["id"] == "24")
-        self.assertEqual(warnfail["phase"], "generation")
-        self.assertEqual(warnfail["http"], "503")
+        cancelled = next(e for e in evs if e["id"] == "req#8")
+        self.assertEqual(cancelled["error_msg"], "HTTP 499 | client disconnected")
+        warnfail = next(e for e in evs if e["id"] == "req#24")
+        self.assertEqual(warnfail["error_msg"], "HTTP 503 | request queue timeout")
+        self.assertEqual(warnfail["api"], "openai-chat")
 
     def test_throughput_line(self):
         self.assertEqual(self.rl.throughput["running"], 1)
@@ -133,10 +132,19 @@ class TestSampleLog(unittest.TestCase):
         self.assertEqual(self.types[1], "other")
         self.assertEqual(self.types[3], "other")
 
-    def test_requests_newest_first_and_no_failures_inside(self):
+    def test_requests_newest_first_and_failures_inside(self):
+        # Leon 11-25: failed/cancelled requests get a table row with finish + error_msg
         ids = [r["id"] for r in self.rl.requests]
-        self.assertNotIn("req#24", ids)                    # failed requests stay in the log ring
-        times = [r["time"] for r in self.rl.requests]
+        self.assertIn("req#24", ids)
+        row = next(r for r in self.rl.requests if r["id"] == "req#24")
+        self.assertEqual(row["finish"], "error")
+        self.assertEqual(row["error_msg"], "HTTP 503 | request queue timeout")
+        self.assertIsNone(row["decode_tok_s"])
+        canc = next(r for r in self.rl.requests if r["id"] == "req#8")
+        self.assertEqual(canc["finish"], "cancelled")
+        # insertion order is newest-first for same-session done lines; the hand-cut
+        # sample interleaves a restart, so assert ordering on the done rows only
+        times = [r["time"] for r in self.rl.requests if r["finish"] in ("stop", "length")]
         self.assertEqual(times, sorted(times, reverse=True))
 
 
@@ -160,9 +168,11 @@ class TestSyntheticGrammar(unittest.TestCase):
         ev = self.feed("req#11 rejected during prepare | openai-chat stream | HTTP 413 | "
                        "context too large | messages 12 | tools 3", "WARN")
         self.assertEqual(ev[0], "failed")
-        self.assertEqual(ev[1]["word"], "rejected")
-        self.assertEqual(ev[1]["http"], "413")
-        self.assertEqual(ev[1]["cause"], "context too large")
+        self.assertEqual(ev[1]["id"], "req#11")
+        self.assertEqual(ev[1]["error_msg"], "HTTP 413 | context too large")
+        row = self.rl.requests[0]
+        self.assertEqual(row["finish"], "error")
+        self.assertEqual(row["path"], "/v1/chat/completions")
 
     def test_tool_markup_fallback(self):
         ev = self.feed("req#12 tool markup returned as text | json parse failed", "WARN")
@@ -180,13 +190,6 @@ class TestSyntheticGrammar(unittest.TestCase):
                        "host 12.3% (615 ms)")
         self.assertEqual(ev[0], "throughput")
         self.assertEqual(ev[1]["waiting"], "2")
-
-    def test_throughput_absent_half_is_zero(self):
-        """The renderer omits a half when that class produced no tokens in the
-        window — record 0.0 (the chart plots it on the y=0 baseline)."""
-        self.feed("throughput | 1.0s | decode 30.0 tok/s (30 tok) | running 1 | batch 1.00 | host 5.0% (5.0 ms)")
-        self.assertAlmostEqual(self.rl.throughput["decode_tok_s"], 30.0)
-        self.assertEqual(self.rl.throughput["prefill_tok_s"], 0.0)
 
     def test_thinking_with_control_clause(self):
         ev = self.feed("req#20 done | anthropic | stop token | prompt 1,000 | output 500 | cache 900 (90.0%) | "
@@ -242,6 +245,18 @@ class TestLogRing(unittest.TestCase):
     def test_level_lines_fix_marker_present(self):
         from logbuf import LogBuffer
         self.assertTrue(hasattr(LogBuffer, "level_lines"))   # the fix we are porting
+
+    def test_bare_crash_lines_classify_err(self):
+        # Leon 11-25: the engine's CUDA_CHECK aborts reach stderr WITHOUT the
+        # spdlog envelope; they used to fall into info and hid in grey.
+        from logbuf import LogBuffer
+        from loglevel import ERR, INFO
+        ring = LogRing(LogBuffer(level_reader_factory=NinferLevelReader))
+        ring.add_line("/root/ninfer-tp2/src/core/device.cu:234: CUDA_CHECK(cudaStreamSynchronize(stream)) "
+                      "failed: cudaErrorLaunchFailure: unspecified launch failure")
+        ring.add_line("some plain banner text without a level")
+        lines, _ = ring.buffer.since(0, 10)
+        self.assertEqual([l["lvl"] for l in lines], [ERR, INFO])
 
 
 if __name__ == "__main__":

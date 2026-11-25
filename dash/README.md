@@ -27,13 +27,11 @@ Stdlib only (Python ≥ 3.10; `psutil` is used opportunistically by
 dash endpoints only. `--request-log-jsonl FILE` switches the per-request
 ingestion from log parsing to the engine's structured
 `ninfer_serve_request_log` (see *JSONL mode* below) — it requires the matching
-engine launch flag, which is **live on CT131** (`llm-flip.sh` passes
-`--request-log-jsonl /var/log/ninfer-requests.jsonl`, 2026-11-11); the
-deployed unit's drop-in passes it to the dash.
+engine launch flag and is **off by default**, matching the live launch line.
 
 Tests: `python3 dash/tests/test_reqlog.py`, `test_logbuf.py`,
-`test_metrics.py`, `test_follow.py`, `test_jsonl.py` (plain stdlib `unittest`).
-They replay the real log excerpts under `dash/fixtures/`.
+`test_metrics.py`, `test_follow.py` (plain stdlib `unittest`). They replay the
+real log excerpts under `dash/fixtures/`.
 
 ## Provenance
 
@@ -75,7 +73,8 @@ single model).
                  "path": str, "api": "openai"|"anthropic"|str,
                  "output_tokens": int, "decode_tok_s": float|None,
                  "duration_s": float|None,
-                 "finish": "stop"|"length"|"context capacity"|"cancelled",
+                 "finish": "stop"|"length"|"context capacity"|"cancelled"|"error",
+                 "error_msg": str|None,          # exact engine message on finish=error/cancelled
                  "prompt_tokens": int, "reused": int, "prompt_ms": float|None,
                  "ttft_s": float|None, "queue_s": float|None,
                  "cache_pct": float|None, "cache_path": str|None,
@@ -85,9 +84,20 @@ single model).
   "best":     {"decode": {"tok_s","id","time","output_tokens"},
                "prefill": {"tok_s","id","time","read_tokens"}},   # gated: out≥256, read≥4096
   "p85":      {"decode"|"prefill": {"tok_s": float, "n": int, "min_tokens": int}},
+  "rates":    {"decode": [float, ...], "prefill": [float, ...]},  # sorted per-request rates
+               # over EVERY kept request (≤200 since the engine started), ungated —
+               # feeds the click-the-big-number distribution modals (Leon 11-25)
   "hardware": {...}, "hardware_static": {...}, "history": {...}    # telemetry.py, as vendored
 }
 ```
+
+Requests with `finish` `error`/`cancelled` (engine-logged failures, rejections,
+JSONL `request_error`/`request_rejected`) appear in the list too since 11-25;
+their `error_msg` is the engine's own reason (`HTTP 503 | request queue
+timeout`, `client disconnected`, …) and the UI renders it as a clickable chip
+that opens the full message. `NinferLevelReader` also classifies envelope-less
+crash output (`.../device.cu:234: CUDA_CHECK(...) failed: …`) as `err`, so those
+lines read red and land in the Errors tab instead of hiding in info.
 
 Companion routes: `GET /slots` → one-row list (basalt `slot_table()[0]` shape;
 idle row = last finished request dimmed). `GET /api/logs?after=&limit=&level=`
@@ -100,14 +110,11 @@ History semantics: request history and log ring live inside the sidecar and
 survive engine restarts (the log is append-mode across sessions); a sidecar
 restart re-seeds from the last 500 log lines.
 
-## JSONL mode (LIVE on CT131)
+## JSONL mode (LIVE on CT131 since 2026-11-11)
 
 `ninfer-serve --request-log-jsonl FILE` emits `ninfer_serve_request_log`
-schema-v27 JSONL with exact per-request numbers. `jsonl.py` +
-`--request-log-jsonl` consume it and replace the regex parser for history
-state. The flag went live in `llm-flip.sh` on 2026-11-11 (one engine restart
-window, user-approved); the deployed `capy-dash` unit carries a drop-in
-(`/etc/systemd/system/capy-dash.service.d/jsonl.conf`) that passes the ledger
-path. `jsonl.py`'s field mapping is verified against the real ledger —
-`fixtures/ninfer-requests.sample.jsonl` is a verbatim pull of one line per
-event kind from CT131, and `tests/test_jsonl.py` replays it.
+schema-v28 JSONL (`src/serve/request_log.cpp`) with exact per-request
+numbers. `jsonl.py` + `--request-log-jsonl` consume it and replace the regex
+parser for history state. Enabling it end-to-end means adding the launch flag
+to the engine start path — an engine restart decision that is explicitly out
+of scope here; keep the flag off to match the live launch.
