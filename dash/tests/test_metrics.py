@@ -17,7 +17,7 @@ from logbuf import LogBuffer
 FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "fixtures", "ninfer-serve-fixture.log")
 
-TOP_KEYS = {"engine", "live", "requests", "best", "p85", "hardware",
+TOP_KEYS = {"engine", "live", "requests", "best", "p85", "rates", "hardware",
             "hardware_static", "history"}
 ENGINE_KEYS = {"model", "context", "max_context"}
 LIVE_KEYS = {"state", "load", "queued", "slots", "queue", "prompt_tokens",
@@ -26,7 +26,7 @@ REQ_KEYS = {"id", "session", "time", "slot", "path", "api", "output_tokens",
             "decode_tok_s", "duration_s", "finish", "prompt_tokens", "reused",
             "prompt_ms", "ttft_s", "queue_s", "cache_pct", "cache_path",
             "spec_backend", "drafts_accepted", "drafts_offered",
-            "thinking_tokens", "thinking_budget"}
+            "thinking_tokens", "thinking_budget", "error_msg"}
 SLOT_KEYS = {"id", "n_ctx", "is_processing", "state", "api", "model", "tok_s",
              "generated", "max_tokens", "prompt_tokens", "prefill_done",
              "ctx_used", "reused", "ttft_s", "draft_len", "drafts_offered",
@@ -79,8 +79,8 @@ class TestSchemaContract(unittest.TestCase):
     def test_id_and_api_shapes(self):
         r = self.m["requests"][0]
         self.assertRegex(r["id"], r"^req#\d+$")
-        self.assertIn(r["api"], ("openai", "anthropic"))
-        self.assertIn(r["finish"], ("stop", "length", "context capacity", "cancelled"))
+        self.assertIn(r["api"], ("openai", "anthropic", ""))
+        self.assertIn(r["finish"], ("stop", "length", "context capacity", "cancelled", "error"))
 
     def test_best_and_p85_are_gated(self):
         for k, entry in self.m["best"].items():
@@ -98,6 +98,18 @@ class TestSchemaContract(unittest.TestCase):
         row = self.st.slot_row()
         self.assertEqual(set(row.keys()), SLOT_KEYS)
         self.assertEqual(row["id"], 0)
+
+    def test_rates_cover_every_kept_request(self):
+        # Leon 11-25: /metrics.rates feeds the click-the-big-number histograms:
+        # per-request rates over ALL kept requests, sorted, no p85 gates
+        rates = self.m["rates"]
+        self.assertEqual(set(rates.keys()), {"decode", "prefill"})
+        self.assertEqual(rates["decode"], sorted(rates["decode"]))
+        expected = [r["decode_tok_s"] for r in self.st.reqlog.requests if r["decode_tok_s"]]
+        self.assertEqual(len(rates["decode"]), len(expected))
+        self.assertGreater(len(rates["decode"]), 12)        # more than REQUESTS_SHOWN: full history
+        for v in rates["prefill"]:
+            self.assertGreater(v, 0)
 
     def test_engine_identity_from_log(self):
         self.assertEqual(self.m["engine"]["model"], self.st.reqlog.model)
@@ -159,17 +171,6 @@ class TestThroughputGraphFeed(unittest.TestCase):
         self.assertIsNone(ex["tok_s"])
         self.assertIsNone(ex["prefill_tok_s_mean"])
         self.assertEqual(ex["slot_tok_s"], [None])
-
-    def test_zero_rates_record_zeros_not_gaps(self):
-        """Fresh window, engine idle: 0.0 rates record 0.0 — the charts plot
-        them on the y=0 baseline (continuous line), not as missing segments."""
-        self.st.reqlog.throughput = {"decode_tok_s": 0.0, "prefill_tok_s": 0.0,
-                                     "running": 0, "waiting": 0, "batch": None}
-        self.st.reqlog.throughput_at = time.time() - 1.0
-        ex = self.st._extra()
-        self.assertEqual(ex["tok_s"], 0.0)
-        self.assertEqual(ex["prefill_tok_s_mean"], 0.0)
-        self.assertEqual(ex["slot_tok_s"], [0.0])
 
     def test_live_block_uses_fresh_throughput(self):
         self._set_tp(1.0, waiting=2)

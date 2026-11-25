@@ -167,14 +167,24 @@ def epoch(date_s, time_s, ms_s):
 
 
 class NinferLevelReader:
-    """loglevel-compatible: the level is the envelope token, no message searching."""
+    """loglevel-compatible: the level is the envelope token, no message searching.
+
+    CAPY-DASH PATCH: a line WITHOUT the envelope is no longer silently info —
+    the engine's crash output (CUDA_CHECK aborts, uncaught C++/Python exceptions)
+    reaches stderr bare, and those lines are exactly what the operator hunts in
+    the Errors tab, so they are classified err."""
 
     def __init__(self):
         self._fallback = None
 
+    # bare crash output: <path>.<ext>:<line>: ... or a Python traceback header
+    CRASH = re.compile(r"\.(?:cu|cpp|cc|hpp|c|py|rs):\d+|Traceback \(most recent call last\)")
+
     def read(self, line: str) -> str:
         m = ENVELOPE.match(line)
-        return LEVEL_MAP.get(m["level"], "info") if m else "info"
+        if m:
+            return LEVEL_MAP.get(m["level"], "info")
+        return "err" if self.CRASH.search(line) else "info"
 
 
 # ---------------------------------------------------------------- structured state
@@ -251,10 +261,32 @@ class ReqLog:
 
         g = REJECTED.match(msg) or FAILED.match(msg) or RESPONSE_FAILED.match(msg)
         if g:
-            self.inflight.pop((self.session, int(g["id"])), None)
-            # finished-but-not-ok requests stay out of the requests table (basalt lists
-            # completed generations there); the line itself reaches the log ring at WARN.
-            return ("failed", g.groupdict())
+            gd = g.groupdict()
+            key = (self.session, int(g["id"]))
+            start = self.inflight.pop(key, None)
+            # LEON FEATURE 11-25: a finished-but-not-ok request now DOES get a row
+            # (finish=error/cancelled, error_msg = `HTTP nnn | cause`), so the
+            # Requests tab can show the exact error on click. Cancel-only lines
+            # (client disconnect) stay at the warn colour, real failures at err.
+            # `response failed` lines carry no api (the renderer didn't have one):
+            # endpoint shows "-", the reason still shows.
+            word = gd.get("word") or "failed"
+            api = gd.get("api") or ""
+            err_bits = [x for x in (f"HTTP {gd['http']}" if gd.get("http") else None,
+                                    gd.get("cause")) if x]
+            row = {"id": f"req#{g['id']}", "session": self.session, "time": t, "slot": 0,
+                   "path": API_PATH.get(api, api), "api": API_MAP.get(api, api),
+                   "output_tokens": None, "decode_tok_s": None,
+                   "duration_s": round(t - start["started"], 2) if start else None,
+                   "finish": "cancelled" if word == "cancelled" else "error",
+                   "prompt_tokens": None, "reused": None, "prompt_ms": None,
+                   "ttft_s": None, "queue_s": None, "cache_pct": None, "cache_path": None,
+                   "spec_backend": None, "drafts_accepted": None, "drafts_offered": None,
+                   "thinking_tokens": None, "thinking_budget": None,
+                   "error_msg": " | ".join(err_bits) or f"{word} during {gd.get('phase') or 'prepare'}"}
+            self.requests.insert(0, row)
+            del self.requests[self.MAX_KEEP:]
+            return ("failed", {"id": row["id"], "api": api, "error_msg": row["error_msg"]})
 
         g = PREFILL_MISS.match(msg)
         if g:
@@ -312,7 +344,8 @@ class ReqLog:
                 "cache_pct": ppct(g["cache_pct"]), "cache_path": g["cache_path"],
                 "spec_backend": g["spec_backend"],
                 "drafts_accepted": pcount(g["spec_acc"]), "drafts_offered": pcount(g["spec_draft"]),
-                "thinking_tokens": pcount(g["think_tokens"]), "thinking_budget": pcount(g["think_budget"])}
+                "thinking_tokens": pcount(g["think_tokens"]), "thinking_budget": pcount(g["think_budget"]),
+                "error_msg": None}
 
 
 class LogRing:

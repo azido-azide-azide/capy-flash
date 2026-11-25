@@ -195,6 +195,71 @@ function drawHero(live, hist, reqs, best, slots) {
   $("#foot-pre").title = (bp ? `Fastest prompt read since the server started: ${bp.id}, ${fmt(bp.read_tokens)} tokens read, ${clock(bp.time * 1000)}` : "") + pNote(pPre, "newly read tokens");
 }
 
+/* ---- modal: one overlay, reused by the error view and the rate distributions ---- */
+let modalEl = null, onKey = null;
+function openModal(titleHtml, bodyHtml, tone) {
+  closeModal();
+  modalEl = document.createElement("div");
+  modalEl.className = "modal";
+  html(modalEl, `<div class="mbox" role="dialog" aria-modal="true">`
+    + `<div class="mhd ${tone || ""}"><span>${titleHtml}</span><button type="button" aria-label="Close">×</button></div>`
+    + `<div class="mbd">${bodyHtml}</div></div>`);
+  modalEl.addEventListener("click", e => { if (e.target === modalEl || e.target.tagName === "BUTTON") closeModal(); });
+  document.body.appendChild(modalEl);
+  onKey = e => { if (e.key === "Escape") closeModal(); };
+  document.addEventListener("keydown", onKey);
+}
+function closeModal() {
+  if (!modalEl) return;
+  modalEl.remove(); modalEl = null;
+  if (onKey) { document.removeEventListener("keydown", onKey); onKey = null; }
+}
+
+/* ---- rate distributions: click the big Decode/Prefill numbers (Leon 11-25) ----
+   histogram of the per-request rates of EVERY kept request (up to 200 since the
+   engine process started), fed by /metrics .rates — not the 60 s chart window. */
+$(".a-hero").addEventListener("click", e => {
+  const d = e.target.closest(".dec, .pre"); if (!d) return;
+  const pre = d.classList.contains("pre");
+  openDist(pre ? "prefill" : "decode");
+});
+function openDist(kind) {
+  const M0 = M || {}; const v = ((M0.rates) || {})[kind] || [];
+  const gate = kind === "decode" ? "generations of ≥ 256 output tokens enter the best/P85 figures below"
+    : "prompt reads of ≥ 4,096 newly read tokens enter the best/P85 figures below";
+  const title = `${kind === "decode" ? "Decode" : "Prefill"} tok/s · every request since the server started`;
+  if (!v.length) { openModal(title, `<div class="empty">No ${kind} rates recorded yet.</div>`); return; }
+  const st = stats(v), med = q(v, .5);
+  const W = 560, H = 190, padL = 34, padB = 20, padT = 10;
+  const lo = v[0], hi = v[v.length - 1];
+  const n = clamp(Math.ceil(Math.log2(v.length) + 1), 1, Math.min(20, new Set(v).size));   // 1,2,3… / Freedman-Diaconis-lite
+  const bw = (hi - lo) / n || 1;
+  const bins = new Array(n).fill(0);
+  v.forEach(x => bins[clamp(Math.floor((x - lo) / bw), 0, n - 1)]++);
+  const top = cntTop(Math.max(...bins));            // count axis: 1,2,5,10,20,50,100,...
+  const iw = W - padL, ih = H - padB - padT, bwid = iw / n;
+  let bars = "", ticksHtml = "";
+  bins.forEach((c, i) => {
+    const hh = c / top * ih;
+    if (c) bars += `<rect x="${(padL + i * bwid + bwid * .12).toFixed(1)}" y="${(padT + ih - hh).toFixed(1)}" width="${(bwid * .76).toFixed(1)}" height="${hh.toFixed(1)}" fill="${kind === "decode" ? SC0 : "var(--fg-2)"}" opacity=".9"/>`;
+    const edge = i === 0 ? padL + bwid * .5 : padL + i * bwid;   // first tick centred on its bar, clear of the y-labels
+    if (c && (i === 0 || bins[i - 1] === 0))   // start of each populated run (the axis max marks the far right)
+      ticksHtml += `<span class="mtk" style="left:${edge / W * 100}%">${tick(i === 0 ? lo : lo + i * bw)}</span>`;
+  });
+  ticksHtml += `<span class="mtk end" style="right:0">${tick(hi)}</span>`;
+  const svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`
+    + [0, .5, 1].map(f => `<line x1="${padL}" x2="${W}" y1="${padT + ih - f * ih}" y2="${padT + ih - f * ih}" stroke="${f === 0 ? "var(--line)" : "var(--line-soft)"}" vector-effect="non-scaling-stroke"/>`).join("")
+    + bars + `</svg>`;
+  openModal(title, `<div class="mstat"><span><b>${fmt(v.length)}</b> requests</span>`
+    + `<span>min <b>${fmt(st.min, 1)}</b></span><span>median <b>${fmt(med, 1)}</b></span>`
+    + `<span>p85 <b>${fmt(q(v, .85), 1)}</b></span><span>p95 <b>${fmt(q(v, .95), 1)}</b></span>`
+    + `<span>max <b>${fmt(st.max, 1)}</b></span></div>`
+    + `<div class="mchart">${svg}${`<span class="mtk yl" style="top:0">${tick(top)}</span><span class="mtk yl" style="top:50%">${tick(top / 2)}</span>`}${ticksHtml}</div>`
+    + `<div class="mnote">${fmt(v.length)} values · ${n} bin${n === 1 ? "" : "s"} · ${gate} · the 60-second line above stays the live view</div>`);
+}
+const q = (sorted, p) => sorted.length ? sorted[clamp(Math.ceil(sorted.length * p) - 1, 0, sorted.length - 1)] : null;
+const cntTop = m => [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000].find(s => s >= m) || Math.ceil(m / 1000) * 1000;
+
 /* ---- main card: Context | Requests | Queue ---- */
 let tab = sessionStorage.getItem("capy.tab") || "req";
 $("#tabs").addEventListener("click", e => {
@@ -202,21 +267,41 @@ $("#tabs").addEventListener("click", e => {
   tab = b.dataset.t; try { sessionStorage.setItem("capy.tab", tab); } catch (err) { /* private mode */ }
   draw();
 });
+/* clicking a request's error/cancel reason opens the exact engine message (Leon 11-25) */
+$("#pane").addEventListener("click", e => {
+  const s = e.target.closest(".ereason"); if (!s || !s.dataset.msg) return;
+  openModal(`Request ${esc(s.dataset.id)} · ${clock((+s.dataset.t * 1000) || Date.now())}`
+    + (s.dataset.ep && s.dataset.ep !== "-" ? ` · ${esc(s.dataset.ep)}` : ""),
+    `<div class="emsg">${esc(s.dataset.msg)}</div>`, "error");
+});
 function requestsPane(live, reqs) {
   const rows = [];
   if (live.state === "reading" || live.state === "generating")
     rows.push({ t: Date.now() / 1000 - (live.elapsed_s || 0), id: "Running", path: "", out: live.generated, tps: live.tok_s, dur: live.elapsed_s, live: true });
-  reqs.forEach(r => rows.push({ t: r.time, id: r.id, path: r.path, out: r.output_tokens, tps: r.decode_tok_s, dur: r.duration_s, finish: r.finish }));
+  reqs.forEach(r => rows.push({ t: r.time, id: r.id, path: r.path, out: r.output_tokens, tps: r.decode_tok_s, dur: r.duration_s,
+                                finish: r.finish, err: r.error_msg }));
   if (!rows.length) return `<div class="empty">No requests yet.</div>`;
   const ep = p => String(p || "-").replace("/v1/", "").replace("chat/completions", "chat");
   return `<table><thead><tr><th>Time</th><th>ID</th><th>Endpoint</th><th class="r">Output</th><th class="r">Rate</th><th class="r">Duration</th></tr></thead><tbody>`
     + rows.map(r => {
-      // a request that did not simply stop is marked on its id, with the reason
+      // a request that did not simply stop is marked on its id, with the reason;
+      // the short reason is clickable and opens the exact message (Leon 11-25)
       const odd = r.finish && r.finish !== "stop" ? (r.finish === "error" ? "err" : "warn") : "";
-      return `<tr${r.live ? ` class="live"` : ""}><td>${clock(r.t * 1000)}</td><td class="${odd}">${esc(r.id)}${odd ? ` · ${esc(r.finish)}` : ""}</td>`
+      const reason = r.finish && r.finish !== "stop"
+        ? ` · <span class="ereason" data-id="${esc(r.id)}" data-t="${r.t}" data-ep="${esc(r.path ? ep(r.path) : "-")}" data-msg="${esc(r.err || r.finish)}" tabindex="0" title="${esc((r.err || r.finish) + " — click for the exact message")}">${esc(shortReason(r.finish, r.err))}</span>`
+        : "";
+      return `<tr${r.live ? ` class="live"` : ""}><td>${clock(r.t * 1000)}</td><td class="${odd}">${esc(r.id)}${reason}</td>`
         + `<td>${r.live ? "-" : esc(ep(r.path))}</td><td class="r">${num(r.out) ? fmt(r.out) : "-"}</td><td class="r">${num(r.tps) ? r.tps.toFixed(1) : "-"}</td>`
         + `<td class="r">${num(r.dur) ? `${r.dur.toFixed(1)} s` : "-"}</td></tr>`;
     }).join("") + `</tbody></table>`;
+}
+// the chip's short label: the last meaningful segment of the message ("… | HTTP 500 | Error type: X: y" -> "X: y")
+function shortReason(finish, errMsg) {
+  if (!errMsg) return finish;
+  const last = String(errMsg).split("|").pop().trim();
+  const m = last.match(/Error type:\s*(.+)/);          // the engine's HTTP body dump prefix
+  const core = (m ? m[1] : last).replace(/"/g, "");
+  return core.length > 42 ? core.slice(0, 41) + "…" : core || finish;
 }
 const mss = s => `${Math.floor(s / 60)}:${p2(Math.floor(s % 60))}`;
 function queuePane(live) {

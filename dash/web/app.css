@@ -235,7 +235,8 @@ tr.live td { color: var(--accent); }
 .logs div { padding-left: 10ch; text-indent: -10ch; overflow-wrap: anywhere; }
 .logs i { font-style: normal; color: var(--fg-3); }
 .logs .warn { color: var(--warn); }
-.logs .err { color: var(--err); }
+.logs .err { color: var(--err); font-weight: 600; }        /* LEON 11-25: errors read unmistakably red */
+.logs .err i { color: var(--err); opacity: .65; }
 .logs .empty { padding: 0; text-indent: 0; }
 
 /* Context (one slot): what the window holds, and per recent request */
@@ -251,6 +252,29 @@ tr.live td { color: var(--accent); }
 .cx-chart { position: relative; flex: 1; margin-top: 12px; margin-bottom: 18px; min-height: 70px; }
 .cx-chart svg { position: absolute; left: 0; top: 0; width: calc(100% - 40px); height: 100%; overflow: visible; }
 .cx-chart .xl { position: absolute; left: 0; bottom: -18px; width: calc(100% - 40px); display: flex; justify-content: space-between; font: 10px/1 var(--font-mono); color: var(--fg-3); }
+
+/* ---- modal (error detail, rate distributions) — Leon 11-25 ---- */
+.ereason { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+.ereason:hover { text-decoration-color: var(--fg-2); }
+.trio .dec, .trio .pre { cursor: pointer; }
+.trio .dec:hover .v, .trio .pre:hover .v { color: var(--accent); }
+.trio .v { transition: color .15s ease; }
+.modal { position: fixed; inset: 0; z-index: 50; background: rgba(6, 9, 12, .72); display: flex; align-items: center; justify-content: center; padding: 24px; }
+.mbox { max-width: min(720px, 94vw); max-height: min(80vh, 720px); overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 18px 60px rgba(0, 0, 0, .5); }
+.mhd { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--line); font: 600 14px/1.3 var(--font-sans); position: sticky; top: 0; background: var(--panel); }
+.mhd.error { color: var(--err); }
+.mhd button { border: 0; background: none; color: var(--fg-3); font-size: 20px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.mhd button:hover { color: var(--fg); }
+.mbd { padding: 18px 20px 20px; }
+.emsg { font: 12.5px/1.7 var(--font-mono); color: var(--err); white-space: pre-wrap; overflow-wrap: anywhere; }
+.mstat { display: flex; flex-wrap: wrap; gap: 16px; font: 12.5px/1 var(--font-mono); color: var(--fg-3); margin-bottom: 16px; white-space: nowrap; }
+.mstat b { color: var(--fg); font-weight: 600; }
+.mchart { position: relative; height: 200px; margin: 0 0 26px; }
+.mchart svg { position: absolute; inset: 0 0 16px 0; width: 100%; height: calc(100% - 16px); }
+.mchart .mtk { position: absolute; bottom: -2px; transform: translateX(-50%); font: 10.5px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; }
+.mchart .mtk.end { transform: none; }
+.mchart .mtk.yl { left: 0; bottom: auto; transform: translateY(-50%); }
+.mnote { font: 11.5px/1.5 var(--font-mono); color: var(--fg-3); border-top: 1px solid var(--line-soft); padding-top: 12px; }
 
 /* Desktop: one screen, nothing scrolls but the panes */
 @media (min-width: 901px) {
