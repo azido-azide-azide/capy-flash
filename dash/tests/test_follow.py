@@ -114,7 +114,7 @@ class TestJsonl(unittest.TestCase):
                 "decode_tok_s", "duration_s", "finish", "prompt_tokens", "reused",
                 "prompt_ms", "ttft_s", "queue_s", "cache_pct", "cache_path",
                 "spec_backend", "drafts_accepted", "drafts_offered",
-                "thinking_tokens", "thinking_budget"}
+                "thinking_tokens", "thinking_budget", "error_msg"}
 
     @staticmethod
     def _base(event):
@@ -153,30 +153,40 @@ class TestJsonl(unittest.TestCase):
         self.assertEqual(req["time"], 1794224096.789)
         self.assertEqual(ing.inflight, {})        # container stays; the entry was popped
 
-    def test_error_event_is_failed(self):
+    def test_error_event_becomes_error_row(self):
+        # Leon 11-25: request_error now lands in .requests with the exact message
         ing = JsonlIngest()
         ev = ing.event(dict(self._base("request_error"),
-                             request={"request_id": 8, "protocol": "anthropic"},
-                             error={"message": "cancelled"}))
-        self.assertEqual(ev, ("failed", {"id": 8}))
+                             request={"request_id": 8, "protocol": "anthropic_messages"},
+                             error={"message": "inference request expired while waiting for admission"}))
+        self.assertEqual(ev[0], "failed")
+        self.assertEqual(ev[1]["error_msg"], "inference request expired while waiting for admission")
+        row = ing.requests[0]
+        self.assertEqual(set(row.keys()), self.REQ_KEYS)
+        self.assertEqual(row["id"], "req#8")
+        self.assertEqual(row["finish"], "error")
+        self.assertEqual(row["path"], "/v1/messages")
+        self.assertIsNone(row["output_tokens"])
+
+    def test_client_disconnect_error_finish_cancelled(self):
+        ing = JsonlIngest()
+        ing.event(dict(self._base("request_error"),
+                       request={"request_id": 9, "protocol": "openai_chat_completions"},
+                       error={"message": "client disconnected"}))
+        self.assertEqual(ing.requests[0]["finish"], "cancelled")
 
     def test_throughput_and_server_start(self):
+        # shapes mirror the real v27 ledger records (fixtures pulled from CT131)
         ing = JsonlIngest()
-        ev = ing.event(dict(self._base("throughput"),
-                                      throughput_tokens_per_second={"decode": 2000.0,
-                                                                   "prefill": 10000.0},
-                                      interval_seconds=5.0,
-                                      scheduler={"running": 1, "waiting": 0,
-                                                 "decode_ready": 1},
+        kind, fields = ing.event(dict(self._base("throughput"),
+                                      throughput_tokens_per_second={"prefill": 2000.0, "decode": 400.0},
+                                      scheduler={"decode_ready": 1, "prefilling": 0,
+                                                 "running": 1, "waiting": 0},
                                       decode_batch={"average_size": 1.0}))
-        assert ev is not None
-        assert ing.throughput is not None
-        kind, fields = ev
         self.assertEqual(kind, "throughput")
         self.assertEqual(fields, {"run_detail": "decode-ready 1"})
-        self.assertEqual(ing.throughput["decode_tok_s"], 2000.0)
-        self.assertEqual(ing.throughput["prefill_tok_s"], 10000.0)
-        self.assertEqual(ing.throughput["running"], 1)
+        self.assertEqual(ing.throughput["decode_tok_s"], 400.0)
+        self.assertEqual(ing.throughput["prefill_tok_s"], 2000.0)
         ing.event(dict(self._base("server_start"),
                        artifact={"name": "qwen3.8-27b-quasar"},
                        engine={"kv_capacity": 262144}))
